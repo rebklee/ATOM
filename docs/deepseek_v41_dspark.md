@@ -284,9 +284,6 @@ window is unchanged; it has not been converted to a nine-step window. Online
 SPS and bucket-global decisions both remain disabled by default pending SA
 latency and throughput validation.
 
-An example V4.1 TP2 measurement, including counter definitions and limits, is
-recorded in [the online SPS SA comparison](deepseek_v41_dspark_online_sps_results.md).
-
 ## Validation
 
 Use the environment described in [the runtime guide](deepseek_v41_runtime.md).
@@ -309,41 +306,6 @@ Restore and accepted-prefix assertions must remain enabled.
 Automated coverage lives in `tests/models/deepseek_v41/` and
 `tests/attentions/deepseek_v41/`. Request-state checks are separate from
 generation-quality and throughput evaluation.
-
-The DP component validator exercises unequal rank loads, idle ranks, mixed
-P/D, arrivals, reorder, bonus floors, bounded copies and online publication:
-
-```bash
-torchrun --standalone --nproc-per-node=4 -m tests.validate_dspark_dp \
-  --tp-size 2 --device cuda --output /tmp/dspark-tp2-dp2.json
-torchrun --standalone --nproc-per-node=4 -m tests.validate_dspark_dp \
-  --tp-size 1 --device cuda --output /tmp/dspark-tp1-dp4.json
-```
-
-For the real-model TP2×DP2 comparison, use a profile matching this topology
-and run each mode in a fresh process:
-
-```bash
-torchrun --standalone --nproc-per-node=4 -m tests.validate_dspark_dp_model \
-  --model /path/to/model --profile /path/to/dp-profile.json \
-  --dp-size 2 --output /tmp/dspark-dp-reference.json
-torchrun --standalone --nproc-per-node=4 -m tests.validate_dspark_dp_model \
-  --model /path/to/model --profile /path/to/dp-profile.json \
-  --dp-size 2 --dynamic --controlled-confidence \
-  --compare-with /tmp/dspark-dp-reference.json \
-  --output /tmp/dspark-dp-dynamic.json
-```
-
-The model validator uses one production scheduler per TP group and broadcasts
-its batches to workers. Controlled confidence stresses graph contraction while
-preserving the draft tokens and target sampling. Compare per-request output
-counts/hashes between modes and check the dynamic report for actual graph
-contractions. This is a correctness probe, not a throughput or confidence-fit
-measurement. An execution-complete report alone does not assert output
-equivalence; `--compare-with` fails on mismatched final output hashes.
-EP/MoRI model execution needs separate validation. The current DP validation
-results and the unresolved full-width repeatability check are recorded in
-[the validation notes](deepseek_v41_dspark_dp_validation.md).
 
 ## Current limitations
 

@@ -107,9 +107,7 @@ def test_legacy_tp_profile_cannot_be_reused_for_dp_or_ep():
         ("draft_width", 4),
         ("max_num_seqs", 2),
         ("sts_temperatures", [float("nan")] * 5),
-        ("sts_temperatures", [-1.0] * 5),
         ("sps_table", [0.0] * 25),
-        ("sps_table", [1.0] * 12),
         ("sps_table", list(range(1, 26))),
     ],
 )

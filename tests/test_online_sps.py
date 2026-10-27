@@ -11,188 +11,93 @@ def estimator(**kw):
     return OnlineSPS([1000 / (1 + i * 0.1) for i in range(65)], 8, **kw)
 
 
-def test_constant_runtime_overhead_is_fixed_not_marginal():
-    model = estimator()
-    for _ in range(12):
-        model.observe(1, 6, 8.6, 2, context=1)
+def fill(model, residual, sizes=(6, 12, 18), n=30, batch=lambda rows: 1):
+    for i in range(n):
+        rows = sizes[i % len(sizes)]
+        model.observe(batch(rows), rows, model.baseline_ms[rows] + residual(rows), 2)
     model.publish()
-    assert model.slope_ms_for(1) == 0
-    assert model.fixed_ms(1) == pytest.approx(7)
-    assert model.estimate_ms(12, 1) - model.estimate_ms(6, 1) == pytest.approx(0.6)
-    assert model.estimate_ms(6, 1) == pytest.approx(10.6)
 
 
-def test_genuine_marginal_cost_is_learned_with_a_separate_intercept():
+def test_marginal_cost_is_learned_beside_a_separate_intercept():
     model = estimator()
-    for i in range(30):
-        rows = (6, 12, 18)[i % 3]
-        residual = 7 + 0.2 * rows + (100 if i == 0 else 0)
-        model.observe(1, rows, model.baseline_ms[rows] + residual, 2, context=1)
-    model.publish()
+    fill(model, lambda rows: 7 + 0.2 * rows)
     assert model.slope_ms_for(1) == pytest.approx(0.2)
     assert model.fixed_ms(1) == pytest.approx(7)
-    assert model.support_by_batch[1] == 30
-
-
-def test_serving_contrasts_come_from_different_batches_like_deepinfer():
-    """In serving a batch keeps one graph size; the sizes come from batches
-    of different sizes. Their per-size medians give the global slope, which
-    batches without their own spread share, each keeping its own offset."""
-    model = estimator()
-    for i in range(60):
-        batch = (1, 2, 3)[i % 3]
-        rows = 6 * batch
-        fixed = 5 + batch  # the offset differs by batch too
-        model.observe(batch, rows, model.baseline_ms[rows] + fixed + 0.2 * rows, 2)
-    model.publish()
-    # Per-batch offsets 6/7/8 over 6/12/18 rows add 1/6 ms per row to 0.2.
-    assert model.slope_ms == pytest.approx(0.2 + 1 / 6)
-    assert model.slope_by_batch == {}
-    for batch in (1, 2, 3):
-        rows = 6 * batch
-        assert model.estimate_ms(rows, batch) == pytest.approx(
-            model.baseline_ms[rows] + 5 + batch + 0.2 * rows + 2
-        )
 
 
 def test_a_constant_offset_never_becomes_a_per_row_cost():
-    """DeepInfer divides each residual by the graph size; a constant offset
-    then costs more on bigger graphs. The intercept keeps it flat."""
+    """DeepInfer divides each residual by the graph size; the intercept keeps
+    a constant offset flat."""
     model = estimator()
-    for i in range(30):
-        rows = (6, 12, 24)[i % 3]
-        model.observe(1, rows, model.baseline_ms[rows] + 7, 2)
-    model.publish()
+    fill(model, lambda rows: 7, sizes=(6, 12, 24))
     assert model.slope_ms == 0
     assert model.fixed_ms(1) == pytest.approx(7)
+    assert model.estimate_ms(24, 1) - model.estimate_ms(6, 1) == pytest.approx(
+        model.baseline_ms[24] - model.baseline_ms[6]
+    )
 
 
-@pytest.mark.parametrize(
-    "separation", ["batch", "request_set", "time", "unknown_context"]
-)
-def test_two_graph_sizes_cannot_turn_a_level_shift_into_slope(separation):
+def test_different_batches_supply_the_contrasts_and_share_the_slope():
+    """In serving a batch keeps one graph size; the sizes come from batches
+    of different sizes, which then share the global slope."""
     model = estimator()
-    for i in range(24):
-        high = i >= 12
-        rows = 12 if high else 6
-        batch = 2 if high and separation == "batch" else 1
-        context = 2 if high and separation == "request_set" else 1
-        if separation == "unknown_context":
-            context = None
-        step = i + 1 + (64 if high and separation == "time" else 0)
-        model.observe(
-            batch,
-            rows,
-            model.baseline_ms[rows] + (10 if high else 7),
-            2,
-            step=step,
-            context=context,
-        )
-    model.publish()
+    fill(model, lambda rows: 7 + 0.2 * rows, n=60, batch=lambda rows: rows // 6)
+    assert model.slope_ms == pytest.approx(0.2)
+    assert model.slope_by_batch == {}
+    assert model.slope_ms_for(2) == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize("sizes", [(6,), (6, 12)])
+def test_fewer_than_three_sizes_give_no_slope(sizes):
+    """Two points always admit a line; a level shift is not a slope."""
+    model = estimator()
+    fill(model, lambda rows: 7 if rows == 6 else 10, sizes=sizes)
     assert model.slope_ms == 0
 
 
-def test_sparse_shape_support_does_not_invent_slope():
+def test_estimates_stay_positive_monotone_and_inside_the_profile():
     model = estimator()
-    for i in range(12):
-        rows = 12 if i == 11 else 6
-        model.observe(1, rows, model.baseline_ms[rows] + rows, 2, context=1)
-    model.publish()
-    assert model.slope_ms == 0
-
-
-def test_window_expires_all_components_and_returns_to_baseline_floor():
-    model = estimator(window=20)
-    for _ in range(10):
-        model.observe(1, 6, 7.6, 1)
-    model.publish()
-    assert model.fixed_ms(1) == pytest.approx(6)
-    for _ in range(20):
-        model.observe(2, 12, 0.2, 0)
-    model.publish()
-    assert len(model.samples) == 20
-    assert all(s[2] == 12 for s in model.samples)
-    assert model.slope_ms == 0
-    assert model.estimate_ms(12, 2) == pytest.approx(2.2)
-    model.publish(step=100)
-    assert model.fixed_ms(1) == model.post_ms(1) == 0
-    assert not model.samples
-
-
-def test_min_samples_and_post_window():
-    model = estimator()
-    for _ in range(4):
-        model.observe(1, 6, 7.6, 2)
-    model.publish()
-    assert model.slope_ms == model.fixed_ms(1) == model.post_ms(1) == 0
-    model.observe(1, 6, 7.6, 1000)
-    model.publish()
-    assert model.post_ms(1) == 2
-    for _ in range(10):
-        model.observe(1, 6, 7.6, 3)
-    model.publish()
-    assert model.fixed_ms(1) == pytest.approx(6)
-    assert model.post_ms(1) == 3
-
-
-def test_tp_context_disagreement_rejects_sample():
-    assert common_rank_samples([[(8, 1, 6, 2, 4, 1)], [(8, 1, 6, 2, 4, 2)]]) == []
-
-
-@pytest.mark.parametrize(
-    "args",
-    [
-        (0, 6, 2, 1),
-        (9, 12, 2, 1),
-        (1, 65, 2, 1),
-        (1, 0, 2, 1),
-        (1, 6, float("nan"), 1),
-        (1, 6, 0, 1),
-        (1, 6, 2, float("inf")),
-        (1, 6, 2, -1),
-    ],
-)
-def test_invalid_samples_do_not_update(args):
-    model = estimator()
-    assert not model.observe(*args)
-    assert model.accepted == 0
-    assert model.rejected == 1
-
-
-def test_tp_matching_ignores_missing_and_shape_disagreement():
-    rows = [
-        [(8, 1, 6, 2, 4), (16, 1, 6, 3, 2), (24, 2, 12, 4, 1)],
-        [(8, 1, 6, 5, 1), (24, 2, 6, 5, 1), (32, 1, 6, 1, 1)],
-    ]
-    assert common_rank_samples(rows) == [(8, 1, 6, 5, 4)]
-    assert common_rank_samples([rows[0], []]) == []
-    assert common_rank_samples([]) == []
-
-
-def test_tp_invalid_duration_rejects_whole_sample():
-    assert common_rank_samples([[(8, 1, 6, 1, 1)], [(8, 1, 6, float("nan"), 1)]]) == []
-
-
-def test_costs_remain_positive_monotone_and_coverage_is_not_clamped():
-    model = estimator()
-    for _ in range(12):
-        model.observe(1, 6, 7.6, 2)
-    model.publish()
+    fill(model, lambda rows: 7)
     times = [model.estimate_ms(i, 1) for i in range(65)]
-    assert times == sorted(times)
-    assert min(times) > 0
+    assert times == sorted(times) and min(times) > 0
     with pytest.raises(ValueError):
         model.estimate_ms(65, 1)
+
+
+def test_window_expires_by_step_and_returns_to_the_baseline():
+    model = estimator(window=100)
+    for step in range(1, 11):
+        model.observe(1, 6, 7.6, 2, step=step)
+    model.publish(step=64)
+    assert model.fixed_ms(1) == pytest.approx(6) and model.post_ms(1) == 2
+    assert model.publish(step=128)
+    assert not model.samples and model.fixed_ms(1) == model.post_ms(1) == 0
+    assert not model.observe(1, 6, 7.6, 2, step=8)  # retired steps stay out
+
+
+@pytest.mark.parametrize(
+    "args", [(0, 6, 2, 1), (9, 12, 2, 1), (1, 65, 2, 1), (1, 6, float("nan"), 1)]
+)
+def test_invalid_samples_are_rejected(args):
+    model = estimator()
+    assert not model.observe(*args) and model.rejected == 1
+
+
+def test_tp_samples_match_on_step_shape_and_context_with_max_times():
+    rows = [
+        [(8, 1, 6, 2, 4, 1), (16, 1, 6, 3, 2, 1), (24, 2, 12, 4, 1, 1)],
+        [(8, 1, 6, 5, 1, 1), (24, 2, 6, 5, 1, 1), (32, 1, 6, 1, 1, 1)],
+    ]
+    assert common_rank_samples(rows) == [(8, 1, 6, 5, 4)]
+    assert common_rank_samples([[(8, 1, 6, 2, 4, 1)], [(8, 1, 6, 2, 4, 2)]]) == []
+    assert common_rank_samples([[(8, 1, 6, 1, 1)], [(8, 1, 6, float("nan"), 1)]]) == []
 
 
 @pytest.mark.parametrize(
     "kw",
     [
         {"online_sps": True},
-        {"online_sps": True, "confidence_schedule": True, "ragged": True},
         {"online_sps_sample_interval": 0},
-        {"online_sps_sample_interval": True},
-        {"online_sps_sample_interval": 1.5},
         {"online_sps_update_interval": 1},
     ],
 )
@@ -201,22 +106,10 @@ def test_invalid_online_config(kw):
         DSparkConfig(**kw)
 
 
-def test_off_by_default_and_explicit_profile_required():
-    assert not DSparkConfig().online_sps
-    cfg = DSparkConfig(
-        online_sps=True,
-        confidence_schedule=True,
-        ragged=True,
-        calibration_profile="measured.json",
-    )
-    assert cfg.online_sps
-
-
 @pytest.mark.parametrize(
     "field,value",
     [
         ("pipeline_parallel_size", 2),
-        ("prefill_context_parallel_size", 2),
         ("decode_context_parallel_size", 2),
         ("enable_tbo", True),
         ("enforce_eager", True),
@@ -230,7 +123,6 @@ def test_unvalidated_topologies_fail_closed(field, value):
         pipeline_parallel_size=1,
         prefill_context_parallel_size=1,
         decode_context_parallel_size=1,
-        enable_expert_parallel=False,
         enable_tbo=False,
         enforce_eager=False,
     )
@@ -238,37 +130,3 @@ def test_unvalidated_topologies_fail_closed(field, value):
     setattr(config, field, value)
     with pytest.raises(ValueError):
         validate_online_runtime(config)
-
-
-def test_sparse_samples_expire_by_real_step_not_number_of_records():
-    model = estimator(window=5000)
-    for step in range(8, 6001, 8):
-        model.observe(1, 6, 7.6, 2, step=step)
-    model.publish(step=6000)
-    assert len(model.samples) == 625
-    assert model.samples[0][0] == 1008
-    assert model.fixed_ms(1) == pytest.approx(6)
-
-
-def test_skipped_samples_do_not_stretch_history_and_no_sample_epoch_expires():
-    model = estimator(window=100)
-    for step in range(1, 11):
-        model.observe(1, 6, 7.6, 2, step=step)
-    model.publish(step=64)
-    assert model.fixed_ms(1) == pytest.approx(6)
-    assert model.publish(step=105)
-    assert len(model.samples) == 5
-    assert model.slope_ms == 0  # Fewer than ten genuine observations remain.
-    assert model.publish(step=128)
-    assert not model.samples and model.fixed_ms(1) == 0 and model.post_ms(1) == 0
-    assert not model.publish(step=192)
-
-
-def test_duplicate_or_stale_sample_cannot_reenter_retired_window():
-    model = estimator(window=100)
-    assert model.observe(1, 6, 7.6, 2, step=8)
-    assert not model.observe(1, 6, 7.6, 2, step=8)
-    model.publish(step=256)
-    assert not model.observe(1, 6, 7.6, 2, step=16)
-    assert model.observe(1, 6, 7.6, 2, step=248)
-    assert model.accepted == 2

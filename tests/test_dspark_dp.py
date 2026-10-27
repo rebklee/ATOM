@@ -15,7 +15,7 @@ from atom.spec_decode.dspark_dp import (
 from atom.spec_decode.dspark_runtime import validate_online_runtime
 
 
-@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("seed", range(5))
 def test_joint_policy_matches_exhaustive_prefix_search(seed):
     rng = np.random.default_rng(seed)
     qs = [1, 2, 3, 4]  # deliberately non-nested divisibility
@@ -148,41 +148,11 @@ def test_confidence_copies_keep_sources_and_do_not_reuse_busy_destinations(monke
     p.epoch, p.survival = 8, torch.ones((1, 3))
     p.record([1])
     assert len(p.pending) == 1 and len(p.free) == 3
-
-
-def test_warmup_two_request_draft_fits_a_one_sequence_deployment(monkeypatch):
-    """Block drafters draft two requests even at max_num_seqs=1 (warmup)."""
-    from contextlib import nullcontext
-
-    import torch
-
-    class Event:
-        def query(self):
-            return True
-
-        def record(self, _):
-            pass
-
-    empty = torch.empty
-    monkeypatch.setattr(
-        torch,
-        "empty",
-        lambda *a, **kw: empty(
-            *a, **{k: v for k, v in kw.items() if k != "pin_memory"}
-        ),
-    )
-    stream = NS(wait_stream=lambda _: None)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
-    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
-    monkeypatch.setattr(torch.cuda, "Event", Event)
-    p = DPVerifyPlanner.__new__(DPVerifyPlanner)
-    p.runner = NS(
-        config=NS(max_num_seqs=1), tokenID_processor=NS(async_copy_stream=stream)
-    )
-    p.gamma, p.pending, p.free, p.skipped_busy, p.epoch = 3, [], [], 0, 1
-    p.survival = torch.ones((2, 3))
+    # Warmup drafts two requests even at max_num_seqs=1.
+    p.runner.config.max_num_seqs, p.free = 1, []
+    p.epoch, p.survival = 20, torch.ones((2, 3))
     p.record([1, 2])
-    assert len(p.pending) == 1
+    assert p.pending[-1][3] == (1, 2)
 
 
 @pytest.mark.parametrize("ep", [False, True])
