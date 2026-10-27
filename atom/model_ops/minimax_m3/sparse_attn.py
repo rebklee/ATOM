@@ -1415,7 +1415,7 @@ def sparse_pa_per_row(
     # sparse_bt/ctx already carry kv-head-encoded page ids (page = phys16*Hkv +
     # kvh), matching the collapsed cache view. Zero-copy; Hkv == 1 is identity.
     assert q.is_contiguous(), "contiguous q required for the kv-head view"
-    T, num_q_heads_total, _ = q.shape
+    T, num_q_heads_total, head_size = q.shape
     g = num_q_heads_total // num_kv_heads
     q_view = q.view(T * num_kv_heads, g, head_size)
     out_view = output.view(T * num_kv_heads, g, head_size)

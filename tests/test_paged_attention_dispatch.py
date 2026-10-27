@@ -1274,8 +1274,7 @@ class TestPlanBatchLimit:
 
         from atom.model_ops import base_attention as ba
 
-        monkeypatch.setattr(ba, "flydsl_decode_seqs", lambda **kw: False)
-        monkeypatch.setattr(ba, "gluon_decode_supports_arch", lambda: True)
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", False)
         seen = {}
 
         def record(*args, **kwargs):
