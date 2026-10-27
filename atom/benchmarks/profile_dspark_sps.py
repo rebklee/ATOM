@@ -19,7 +19,6 @@ from atom.config import (
     CUDAGraphMode,
     SpeculativeConfig,
 )
-from atom.model_engine.model_runner import ModelRunner
 from atom.spec_decode.calibration import (
     calibration_identity,
     single_node_parallel_config,
@@ -32,17 +31,24 @@ from atom.utils.forward_context import (
 from atom.utils.region_graph import TokenGraph
 
 
-class ProfileRunner(ModelRunner):
-    def _record_prefill_graphs(self):
-        # Disposable decode-only calibration. Serving records its prefill
-        # graphs normally; none of these synthetic caches are served.
-        pass
+def ProfileRunner(*args, **kwargs):
+    """Build the profiling runner. ModelRunner (and with it aiter) is imported
+    only here, so argument checks run and are testable without a GPU stack."""
+    from atom.model_engine.model_runner import ModelRunner
 
-    def _dspark_capture_q_buckets(self, full_q):
-        # Capture the actual supported target buckets without enabling a
-        # confidence scheduler that would itself require this output profile.
-        assert full_q == 6
-        return [1, 3, 6]
+    class _ProfileRunner(ModelRunner):
+        def _record_prefill_graphs(self):
+            # Disposable decode-only calibration. Serving records its prefill
+            # graphs normally; none of these synthetic caches are served.
+            pass
+
+        def _dspark_capture_q_buckets(self, full_q):
+            # Capture the actual supported target buckets without enabling a
+            # confidence scheduler that would itself require this output profile.
+            assert full_q == 6
+            return [1, 3, 6]
+
+    return _ProfileRunner(*args, **kwargs)
 
 
 @torch.inference_mode()

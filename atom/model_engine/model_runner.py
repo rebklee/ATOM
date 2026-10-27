@@ -937,7 +937,7 @@ class ModelRunner:
         # Install after initialization warmup, which is not request traffic.
         # Graph capture runs later via RPC and bypasses run_model, so its
         # timing decorator does not run during capture.
-        calibration_dir = os.environ.get("ATOM_DSPARK_CALIBRATION_DIR")
+        calibration_dir = envs.ATOM_DSPARK_CALIBRATION_DIR
         if calibration_dir:
             from atom.benchmarks.dspark_capture import install
 

@@ -1039,6 +1039,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --enforce-eager does NOT disable it: support_torch_compile keys off
     # compilation_config.level only (see atom/utils/decorators.py:485).
     # Default: False (compile the draft).
+    # Offline DSpark STS calibration: when set, rank 0 wraps the runner's
+    # forward/draft/commit to append confidence/acceptance records to this
+    # directory (`atom/benchmarks/dspark_capture.py`). Synchronizes on every
+    # sampled step; never set it on a serving deployment being measured.
+    "ATOM_DSPARK_CALIBRATION_DIR": lambda: (
+        os.getenv("ATOM_DSPARK_CALIBRATION_DIR") or None
+    ),
     "ATOM_DSPARK_DISABLE_COMPILE": lambda: (
         os.getenv("ATOM_DSPARK_DISABLE_COMPILE", "0") == "1"
     ),
