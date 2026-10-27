@@ -3,11 +3,30 @@
 
 import pytest
 
+from atom.kv_transfer.disaggregation.port_offset import layer_region_indices
 from atom.kv_transfer.disaggregation.types import (
     KVTransferRegion,
     KVTransferTensors,
     PageRegion,
 )
+
+
+def test_field_groups_share_global_offsets_with_compact_index_layers():
+    # A last PP stage holds target layers 3..5 and draft layer 6. The index
+    # field exists on 0/3/5 and the draft; scale planes have the same owners.
+    indices, count = layer_region_indices(
+        [([3, 4, 5, 6], range(7)), ([3, 5, 6], [0, 3, 5, 6])]
+    )
+    assert indices == [3, 4, 5, 6, 8, 9, 10]
+    assert count == 11
+    # An empty local group still reserves the complete global field space.
+    assert layer_region_indices([([2], range(4)), ([], [0, 3])]) == ([2], 6)
+
+
+@pytest.mark.parametrize("group", [([1], [0]), ([0], [0, 0])])
+def test_invalid_layer_group_is_refused(group):
+    with pytest.raises(ValueError):
+        layer_region_indices([group])
 
 
 def _tensors(n, indices=None, count=None):

@@ -203,7 +203,10 @@ def capture_fixture(monkeypatch):
     proposer.speculative_config = SimpleNamespace(
         draft_model_hf_config=SimpleNamespace(dspark_target_layer_ids=(0,))
     )
-    proposer.config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=8))
+    proposer.config = SimpleNamespace(
+        hf_config=SimpleNamespace(hidden_size=8),
+        speculative_config=proposer.speculative_config,
+    )
     proposer.max_num_tokens, proposer.device, proposer.dtype = 9, "cpu", torch.float32
     target = nn.Module()
     target.layers = nn.ModuleList([ShiftBlock()])

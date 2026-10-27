@@ -1,32 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Carry a DSpark drafter's tapped target layers across pipeline stages.
+"""Carry a drafter's declared target taps across pipeline stages.
 
-The drafter lives on the last PP stage, but most of its taps (M3.1: layers
-3/17/31/45/59) run on earlier ones, where its hooks would sit on placeholders
-and never fire. Each earlier stage taps the layers it runs and sends the
-captures on with its hidden states; the last stage hands them to the drafter.
+The drafter lives on the last PP stage. Its hooks for earlier layers sit on
+placeholders and never fire. Each earlier stage captures the layers it runs
+and sends those tensors with its hidden states; the last stage hands them to
+the drafter through the same buffers used by local capture.
 """
 
 import torch
 
 from atom.distributed.pp_comm import PP_DRAFT_AUX_PREFIX
 from atom.models.utils import PPMissingLayer
-from atom.spec_decode.drafter import Drafter, _resolve_decoder_layers
-from atom.spec_decode.dspark_proposer import DSparkProposer
+from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 
 
 class PPAuxRelay:
-    def __init__(self, config, target_model, drafter, device):
-        if getattr(getattr(drafter, "model", None), "target_aux_capture_spec", None):
-            raise NotImplementedError("PP cannot relay a draft's own target taps")
-        draft_cfg = config.speculative_config.draft_model_hf_config
-        self.layer_ids = tuple(int(i) for i in draft_cfg.dspark_target_layer_ids)
-        if not self.layer_ids or min(self.layer_ids) < 0:
-            raise NotImplementedError(f"cannot relay taps {self.layer_ids} under PP")
-        layers = _resolve_decoder_layers(target_model)
-        held = [i for i in self.layer_ids if not isinstance(layers[i], PPMissingLayer)]
+    def __init__(self, config, target_model, drafter, device, spec: AuxCaptureSpec):
+        self.layer_ids = spec.layer_ids
+        held = {
+            lid: (module, extract)
+            for lid, module, extract in spec.resolve_taps(target_model)
+            if not isinstance(module, PPMissingLayer)
+        }
         # The last stage taps its own layers through the drafter's hooks and
         # must be handed every other one.
         self._expected = set(self.layer_ids) - set(held) if drafter else set()
@@ -35,14 +32,16 @@ class PPAuxRelay:
         for i in held if drafter is None else []:
             self._captures[i] = torch.zeros(
                 config.max_num_batched_tokens,
-                config.hf_config.hidden_size,
+                spec.hidden_size,
                 dtype=config.torch_dtype,
                 device=device,
             )
-            layers[i].register_forward_hook(
-                Drafter.aux_capture_hook(
-                    self._captures[i], DSparkProposer._extract_layer_hidden
-                )
+            module, extract = held[i]
+            Drafter.register_aux_capture(
+                module,
+                self._captures[i],
+                extract,
+                "output" if i == -1 else spec.capture,
             )
 
     def take_received(self, payload) -> None:

@@ -46,6 +46,30 @@ class AuxCaptureSpec:
         if self.capture not in ("output", "input"):
             raise ValueError("Aux capture must select layer input or output")
 
+    def resolve_taps(self, target_model: nn.Module):
+        """Resolve and validate the same taps for local capture and PP relay."""
+        layers = _resolve_decoder_layers(target_model)
+        n_layers = len(layers)
+        taps, prev = [], None
+        for lid in self.layer_ids:
+            if not (lid == -1 or 0 <= lid < n_layers):
+                raise ValueError(
+                    f"aux capture layer id {lid} out of range {{-1}} U [0,{n_layers})."
+                )
+            if prev is not None and lid <= prev:
+                raise ValueError(
+                    "aux capture layer ids must be strictly increasing, got "
+                    f"{self.layer_ids}."
+                )
+            prev = lid
+            module, extract = (
+                (_resolve_embedding(target_model), _identity_extract)
+                if lid == -1
+                else (layers[lid], self.extract)
+            )
+            taps.append((lid, module, extract))
+        return taps
+
 
 # Descent bound for the `.model` wrapper chain below — big enough for every
 # nesting we ship (UBatchWrapper -> ForCausalLM -> Model), small enough that a
@@ -321,6 +345,14 @@ class Drafter(abc.ABC):
         this; the base ``arm_aux_capture`` turns the spec into forward hooks."""
         return None
 
+    @classmethod
+    def config_aux_capture_spec(cls, config: Config) -> AuxCaptureSpec | None:
+        """Aux contract available without loading draft weights on a PP stage.
+
+        None for drafters such as MTP that consume only the last target state.
+        """
+        return None
+
     @abc.abstractmethod
     def propose(
         self,
@@ -382,39 +414,17 @@ class Drafter(abc.ABC):
             )
             for _ in spec.layer_ids
         ]
-        layers = _resolve_decoder_layers(target_model)
-        n_layers = len(layers)
         # Reference convention (deepspec validate_target_layer_ids): ids must be
         # strictly increasing and each in {-1} U [0, n_layers). Each id resolves to
         # a (module, extract) tap funneled through the SAME hook: -1 taps the
         # embedding output (hidden_states[0], taken verbatim); k taps decoder
         # layer k's output through the drafter's mHC extract.
-        prev = None
-        for buf_idx, lid in enumerate(spec.layer_ids):
-            if not (lid == -1 or 0 <= lid < n_layers):
-                raise ValueError(
-                    f"aux capture layer id {lid} out of range {{-1}} U [0,{n_layers})."
-                )
-            if prev is not None and lid <= prev:
-                raise ValueError(
-                    "aux capture layer ids must be strictly increasing, got "
-                    f"{spec.layer_ids}."
-                )
-            prev = lid
-            module, extract = (
-                (_resolve_embedding(target_model), _identity_extract)
-                if lid == -1
-                else (layers[lid], spec.extract)
+        for buffer, (lid, module, extract) in zip(
+            self._aux_buffers, spec.resolve_taps(target_model), strict=True
+        ):
+            self.register_aux_capture(
+                module, buffer, extract, "output" if lid == -1 else spec.capture
             )
-            hook = self._make_aux_hook(buf_idx, extract)
-            if lid != -1 and spec.capture == "input":
-
-                def pre_hook(module, inputs, hook=hook):
-                    hook(module, (), inputs)
-
-                module.register_forward_pre_hook(pre_hook)
-            else:
-                module.register_forward_hook(hook)
         self._captures_aux = True
         self._aux_layer_ids = tuple(spec.layer_ids)
         # A target that runs some layers on a subset of rows (V4.1 bounded
@@ -432,6 +442,18 @@ class Drafter(abc.ABC):
 
     def _make_aux_hook(self, buf_idx: int, extract):
         return Drafter.aux_capture_hook(self._aux_buffers[buf_idx], extract)
+
+    @staticmethod
+    def register_aux_capture(module, buffer, extract, capture="output"):
+        """Install the shared capture hook, including input and embedding taps."""
+        hook = Drafter.aux_capture_hook(buffer, extract)
+        if capture == "input":
+
+            def pre_hook(module, inputs):
+                hook(module, (), inputs)
+
+            return module.register_forward_pre_hook(pre_hook)
+        return module.register_forward_hook(hook)
 
     @staticmethod
     def aux_capture_hook(buffer: torch.Tensor, extract):

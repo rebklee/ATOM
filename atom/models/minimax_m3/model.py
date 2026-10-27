@@ -859,41 +859,38 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         """
         from dataclasses import replace
 
+        from atom.kv_transfer.disaggregation.port_offset import layer_region_indices
         from atom.model_ops.minimax_m3.sparse_attn import ASM_PAGE_SIZE
 
         if len(builder.kv_pools) != 1:
             raise ValueError("MiniMax-M3 transfer expects one KV-head geometry")
         ((geometry, pool),) = builder.kv_pools.items()
         num_layers = self.config.num_hidden_layers
-        index_slots = _sparse_attention_layer_ordinals(self.config)
+        index_layers = sorted(_sparse_attention_layer_ids(self.config))
         local_layers = [
             module.layer_num
             for module, _ in sorted(
                 builder.pool_rows[geometry].items(), key=lambda item: item[1]
             )
         ]
+        local_index_layers = [layer for layer in local_layers if layer in index_layers]
         # Sparse KV is written as page-16 SHUFFLE runs inside a scheduler
         # block; dense KV uses the pool's page. Indexer keys are replicated.
         head_runs = {
             layer: (
                 builder.model_runner.block_size
-                // (ASM_PAGE_SIZE if layer in index_slots else pool.block_size),
+                // (ASM_PAGE_SIZE if layer in index_layers else pool.block_size),
                 pool.num_kv_heads,
             )
             for layer in local_layers
         }
         fields = pool.cache_fields + pool.scale_fields
         layout = [
-            (field.name, layer, i * num_layers + layer, head_runs[layer])
-            for i, field in enumerate(fields)
+            (field.name, layer, head_runs[layer])
+            for field in fields
             for layer in local_layers
         ]
-        index_offset = len(fields) * num_layers
-        layout.extend(
-            ("index", layer, index_offset + index_slots[layer], None)
-            for layer in local_layers
-            if layer in index_slots
-        )
+        layout.extend(("index", layer, None) for layer in local_index_layers)
         # Keep the backend's byte views and addresses; only annotate layout.
         transfer_tensors.pages = [
             replace(
@@ -901,12 +898,17 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 region=replace(page.region, semantic_role=f"m3.layer_{layer}.{field}"),
                 head_major_runs=runs,
             )
-            for page, (field, layer, _, runs) in zip(
+            for page, (field, layer, runs) in zip(
                 transfer_tensors.pages, layout, strict=True
             )
         ]
-        transfer_tensors.block_region_consumer_indices = [row[2] for row in layout]
-        transfer_tensors.block_region_consumer_count = index_offset + len(index_slots)
+        (
+            transfer_tensors.block_region_consumer_indices,
+            transfer_tensors.block_region_consumer_count,
+        ) = layer_region_indices(
+            [(local_layers, range(num_layers)) for _ in fields]
+            + [(local_index_layers, index_layers)]
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.get_input_embeddings(input_ids)

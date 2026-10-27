@@ -80,7 +80,6 @@ from atom.models.dspark_draft import (
     linear_out,
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
-from atom.models.utils import PPMissingLayer
 from atom.utils.forward_context import get_forward_context
 
 if TYPE_CHECKING:
@@ -520,12 +519,9 @@ class MiniMaxM3DSpark(DSparkDraftModel):
     # ---- weight-loading hooks ---------------------------------------------
 
     def share_with_target(self, target_base: nn.Module, loaded: set) -> None:
-        # Under PP the draft's stage (the last) has a placeholder embedding; it
-        # only writes context K/V there, and the LM head gives the vocab.
-        embed = target_base.model.embed_tokens
-        if isinstance(embed, PPMissingLayer):
-            embed = target_base.lm_head
-        target_vocab = embed.num_embeddings
+        # The shared output head is present both under PP and on an unsplit
+        # target; the input embedding may belong to an earlier stage.
+        target_vocab = target_base.lm_head.num_embeddings
         if target_vocab != self.vocab_size:
             raise ValueError(
                 f"DSpark draft vocab {self.vocab_size} != target vocab "

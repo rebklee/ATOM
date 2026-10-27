@@ -18,6 +18,7 @@ import torch
 
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
+from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
 from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
 from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder
@@ -76,6 +77,11 @@ _configure_wrapper = _cache_methods(
 _runner_transfer = _cache_methods(
     "atom/model_engine/model_runner.py", "ModelRunner", ("_get_kv_transfer_tensors",)
 )["_get_kv_transfer_tensors"]
+_mla_export = _cache_methods(
+    "atom/model_ops/attentions/aiter_mla.py",
+    "AiterMLAMetadataBuilder",
+    ("get_kv_transfer_tensors",),
+)["get_kv_transfer_tensors"]
 
 
 class _Layer:
@@ -212,6 +218,80 @@ def test_runner_without_transfer_regions():
     builder = _m3_builder([0], [True], 4, CONFIG)
     builder.kv_pools = {}
     assert _export(builder) is None
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize("stage", [0, 1])
+def test_mla_export_preserves_compact_layers_mtp_and_scale_offsets(
+    monkeypatch, hybrid, fp4, stage
+):
+    from aiter.dist import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=stage, world_size=2),
+    )
+    target = [1, 3, 5] if hybrid else list(range(6))
+    global_index = [1, 5, 6] if hybrid else [0, 3, 5, 6]
+    local_kv = [i for i in target if stage * 3 <= i < (stage + 1) * 3]
+    if stage == 1:
+        local_kv.append(6)  # MTP is held only by the last stage.
+    local_index = [i for i in global_index if i in local_kv]
+    pool = MlaKvPool(
+        layers=len(local_kv),
+        block_size=64,
+        entry_dim=16,
+        kv_dtype=torch.float16,
+        index_layers=len(local_index),
+        index_rows_per_block=64,
+        index_dim=144,
+        index_dtype=torch.uint8,
+        index_head_dim=128,
+        index_fp4=fp4,
+    )
+    pool.allocate(4, "cpu")
+    runner = SimpleNamespace(
+        config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=6),
+            tensor_parallel_size=4,
+            kv_transfer_config={"kv_connector": "lmcache_mp"},
+        ),
+        index_cache_layer_ids=tuple(local_index),
+        full_attention_layers=target if hybrid else None,
+    )
+    builder = SimpleNamespace(
+        model_runner=runner,
+        kv_pool=pool,
+        _indexer_fp4=fp4,
+        _local_draft_rows=lambda: int(stage == 1),
+        _index_cache_layout=lambda: (tuple(local_index), tuple(global_index)),
+    )
+    transfer = _mla_export(builder)
+    kv_indices = (
+        ([0] if stage == 0 else [1, 2, 3])
+        if hybrid
+        else ([0, 1, 2] if stage == 0 else [3, 4, 5, 6])
+    )
+    index_indices = (
+        ([4] if stage == 0 else [5, 6])
+        if hybrid
+        else ([7] if stage == 0 else [8, 9, 10])
+    )
+    expected = kv_indices + index_indices
+    if fp4:
+        expected += [i + len(global_index) for i in index_indices]
+    count = len(target) + 1 + len(global_index) * (2 if fp4 else 1)
+    assert transfer.block_region_consumer_indices == expected
+    assert transfer.block_region_consumer_count == count
+    assert len(transfer.pages) == len(expected)
+    # A separate contributor starts after the full target/MTP layout, even
+    # though this stage holds only a subset of those regions.
+    transfer.merge_pages(_draft_tensors(1))
+    assert transfer.block_region_consumer_indices[len(expected) :] == list(
+        range(count, count + 8)
+    )
 
 
 @pytest.mark.parametrize("heads", [1, 4])

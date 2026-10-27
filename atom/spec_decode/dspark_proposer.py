@@ -511,7 +511,15 @@ class DSparkProposer(Drafter):
     # ---- aux-hidden-state ownership (declarative; base owns the hook machinery) ----
     def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec:
         """Resolve the draft's feature contract; the base owns capture buffers."""
-        draft_cfg = self.speculative_config.draft_model_hf_config
+        spec = self.config_aux_capture_spec(self.config)
+        own = getattr(self.model, "target_aux_capture_spec", None)
+        if own is not None:
+            return own(spec.layer_ids, spec.hidden_size)
+        return spec
+
+    @classmethod
+    def config_aux_capture_spec(cls, config) -> AuxCaptureSpec:
+        draft_cfg = config.speculative_config.draft_model_hf_config
         layer_ids = tuple(
             int(i) for i in getattr(draft_cfg, "dspark_target_layer_ids", ())
         )
@@ -519,13 +527,10 @@ class DSparkProposer(Drafter):
             raise ValueError(
                 "DSpark requires dspark_target_layer_ids on the draft config."
             )
-        own = getattr(self.model, "target_aux_capture_spec", None)
-        if own is not None:
-            return own(layer_ids, self.config.hf_config.hidden_size)
         return AuxCaptureSpec(
             layer_ids=layer_ids,
-            hidden_size=self.config.hf_config.hidden_size,
-            extract=self._extract_layer_hidden,
+            hidden_size=config.hf_config.hidden_size,
+            extract=cls._extract_layer_hidden,
         )
 
     @staticmethod

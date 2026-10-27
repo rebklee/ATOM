@@ -1526,6 +1526,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.page_region import page_region
+        from atom.kv_transfer.disaggregation.port_offset import layer_region_indices
         from atom.kv_transfer.disaggregation.types import (
             INDEX_CACHE_ROLE,
             MLA_KV_ROLE,
@@ -1605,6 +1606,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
 
         block_region_consumer_indices = None
+        block_region_consumer_count = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
         if index_cache_layer_ids:
             local_index_layer_ids, global_index_layer_ids = self._index_cache_layout()
@@ -1628,24 +1630,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             num_global_draft_layers = sum(
                 layer_id >= num_hidden_layers for layer_id in global_index_layer_ids
             )
-            # Index-cache regions are numbered after the KV regions, so this
-            # offset must count the KV rows that actually exist -- the MLA
-            # layers for a hybrid, every layer otherwise.
-            num_global_mla_layers = (
-                len(hybrid_mla_layers)
+            global_target_layer_ids = tuple(
+                hybrid_mla_layers
                 if hybrid_mla_layers is not None
-                else num_hidden_layers
+                else range(num_hidden_layers)
             )
-            num_global_kv_layers = num_global_mla_layers + num_global_draft_layers
-            # Unlike index_cache_layer_map (PP-local allocated rows), this map
-            # numbers compact index-cache rows in the consumer's global region
-            # list. It is used only to translate local P/D regions.
-            global_compact_index_slot_by_layer = {
-                global_layer_id: compact_layer_id
-                for compact_layer_id, global_layer_id in enumerate(
-                    global_index_layer_ids
-                )
-            }
             from aiter.dist.parallel_state import get_pp_group
 
             from atom.models.utils import get_pp_indices
@@ -1654,58 +1643,41 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             start_layer, end_layer = get_pp_indices(
                 num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
             )
-            if hybrid_mla_layers is not None:
-                local_target_layer_ids = tuple(
-                    layer_id
-                    for layer_id in hybrid_mla_layers
-                    if start_layer <= layer_id < end_layer
-                )
-                compact_mla_slot_by_layer = {
-                    global_layer_id: compact_layer_id
-                    for compact_layer_id, global_layer_id in enumerate(
-                        hybrid_mla_layers
-                    )
-                }
-                local_target_consumer_indices = tuple(
-                    compact_mla_slot_by_layer[layer_id]
-                    for layer_id in local_target_layer_ids
-                )
-            else:
-                local_target_layer_ids = tuple(range(start_layer, end_layer))
-                local_target_consumer_indices = local_target_layer_ids
+            local_target_layer_ids = tuple(
+                layer_id
+                for layer_id in global_target_layer_ids
+                if start_layer <= layer_id < end_layer
+            )
             num_local_target_layers = len(local_target_layer_ids)
             # From the draft's modules, not `num_layers - target`: derived that
             # way the count below adds back up to `num_layers` by construction
             # and the check cannot fail. Two independent walks make it a check.
             num_local_draft_layers = self._local_draft_rows()
-            local_kv_consumer_indices = local_target_consumer_indices + tuple(
-                range(
-                    num_global_mla_layers,
-                    num_global_mla_layers + num_local_draft_layers,
-                )
+            local_kv_layer_ids = local_target_layer_ids + tuple(
+                range(num_hidden_layers, num_hidden_layers + num_local_draft_layers)
             )
-            if len(local_kv_consumer_indices) != num_layers:
+            global_kv_layer_ids = global_target_layer_ids + tuple(
+                range(num_hidden_layers, num_hidden_layers + num_global_draft_layers)
+            )
+            if len(local_kv_layer_ids) != num_layers:
                 raise RuntimeError(
                     "MLA KV cache layer count does not match the PP-local layout: "
-                    f"cache={num_layers}, layout={len(local_kv_consumer_indices)}, "
+                    f"cache={num_layers}, layout={len(local_kv_layer_ids)}, "
                     f"target={num_local_target_layers}, "
                     f"draft={num_local_draft_layers}"
                 )
-            block_region_consumer_indices = list(local_kv_consumer_indices) + [
-                num_global_kv_layers + global_compact_index_slot_by_layer[layer_id]
-                for layer_id in local_index_layer_ids
+            groups = [
+                (local_kv_layer_ids, global_kv_layer_ids),
+                (local_index_layer_ids, global_index_layer_ids),
             ]
             if self._indexer_fp4:
                 # `region_tensors` publishes the FP4 scale planes after the
-                # index data planes, one per index layer; number them after
-                # every consumer's index regions so the list still names one
-                # consumer region per published PAGE region.
-                block_region_consumer_indices += [
-                    num_global_kv_layers
-                    + len(global_index_layer_ids)
-                    + global_compact_index_slot_by_layer[layer_id]
-                    for layer_id in local_index_layer_ids
-                ]
+                # index data planes, with the same layer ownership.
+                groups.append((local_index_layer_ids, global_index_layer_ids))
+            (
+                block_region_consumer_indices,
+                block_region_consumer_count,
+            ) = layer_region_indices(groups)
 
         index_staging_region = None
         index_staging_pool_size = 0
@@ -1778,6 +1750,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return KVTransferTensors(
             pages=pages,
             block_region_consumer_indices=block_region_consumer_indices,
+            block_region_consumer_count=block_region_consumer_count,
             index_staging_region=index_staging_region,
             index_staging_pool_size=index_staging_pool_size,
             index_staging_chunk_pages=index_staging_chunk_pages,

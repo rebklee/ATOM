@@ -2439,6 +2439,8 @@ class MooncakeConnector(KVConnectorBase):
         def queue_descriptors(srcs, dsts, lens) -> bool:
             """Queue address arrays, flushing each batch as it fills."""
             nonlocal block_descriptor_count, total_block_bytes
+            if len(srcs) != len(dsts) or len(srcs) != len(lens):
+                raise ValueError("RDMA source, destination and size counts disagree")
             start = 0
             while start < len(srcs):
                 stop = min(
@@ -2525,6 +2527,8 @@ class MooncakeConnector(KVConnectorBase):
         # producer/consumer layouts fail instead of silently corrupting KV.
         consumer_bpb = request_data.get("consumer_block_bpb")
         head_cut = self._consumer_head_cut(request_data, dcp_size)
+        source_blocks = np.asarray(src_block_ids, dtype=np.int64)
+        destination_blocks = np.asarray(dst_block_ids, dtype=np.int64)
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
@@ -2555,10 +2559,8 @@ class MooncakeConnector(KVConnectorBase):
                     ),
                     dtype=np.int64,
                 )
-                src = np.asarray(src_block_ids, np.int64)[:, None] * bpb + cuts[:, 0]
-                dst = (
-                    np.asarray(dst_block_ids, np.int64)[:, None] * dst_bpb + cuts[:, 1]
-                )
+                src = source_blocks[:, None] * bpb + cuts[:, 0]
+                dst = destination_blocks[:, None] * dst_bpb + cuts[:, 1]
                 if not queue_descriptors(
                     (src_base + src).ravel(),
                     (dst_base + dst).ravel(),
@@ -2577,21 +2579,13 @@ class MooncakeConnector(KVConnectorBase):
                 staged_regions.append((region_idx, dst_base, bpb))
                 continue
             if sharded_runs is None:
-                for sb, db in zip(src_block_ids, dst_block_ids):
-                    src_addrs.append(src_base + sb * bpb)
-                    dst_addrs.append(dst_base + db * bpb)
-                    sizes.append(bpb)
-                    block_descriptor_count += 1
-                    if debug_block_transfer:
-                        total_block_bytes += bpb
-                    if (
-                        len(src_addrs) == self._MAX_RDMA_ENTRIES_PER_BATCH
-                        and not flush_block_descriptors()
-                    ):
-                        logger.error(
-                            "[PRODUCER] block transfer failed for req %s", req_id
-                        )
-                        return False
+                if not queue_descriptors(
+                    src_base + source_blocks * bpb,
+                    dst_base + destination_blocks * bpb,
+                    np.full(source_blocks.size, bpb, dtype=np.int64),
+                ):
+                    logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+                    return False
                 continue
             if role != MLA_KV_ROLE:
                 raise RuntimeError(

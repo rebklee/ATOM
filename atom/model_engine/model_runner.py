@@ -717,7 +717,7 @@ def _profile_runner_stage(method):
 
 
 class ModelRunner:
-    # Carries a DSpark drafter's taps across PP stages (`PPAuxRelay`).
+    # Carries a drafter's declared taps across PP stages (`PPAuxRelay`).
     _pp_aux_relay = None
 
     def __init__(self, rank: int, config: Config):
@@ -912,11 +912,10 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
-        spec_config = self.config.speculative_config
-        if spec_config and spec_config.use_dspark() and get_pp_group().world_size > 1:
-            from atom.spec_decode.pp_aux_relay import PPAuxRelay
+        if self.config.speculative_config and get_pp_group().world_size > 1:
+            from atom.spec_decode.factory import build_pp_aux_relay
 
-            self._pp_aux_relay = PPAuxRelay(
+            self._pp_aux_relay = build_pp_aux_relay(
                 self.config, self.model, getattr(self, "drafter", None), self.device
             )
         installer = mono_decode_installers.get(hf_config.architectures[0])
@@ -3413,9 +3412,9 @@ class ModelRunner:
         else:
             prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
-            # PP stages and P/D producers still run the drafter -- but not a
-            # PP producer's DSpark: its drafts are dropped (`mtp_k` 0), its
-            # context K/V is already written, and a TP1 stage cannot draft.
+            # On the PP producer path, an independent context-KV pass has
+            # already done all required work. Serial MTP still needs propose's
+            # first pass to finish its KV; the capability states that dependency.
             pp_producer = (
                 self.tokenID_processor.is_pd_producer
                 and self.tokenID_processor.is_pipeline_parallel

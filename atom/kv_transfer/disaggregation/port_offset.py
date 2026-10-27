@@ -1,9 +1,33 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Deterministic side-channel port layout for KV disaggregation."""
+"""Worker port offsets and PP region mappings for KV disaggregation."""
 
 from __future__ import annotations
+
+from collections.abc import Sequence
+
+
+def layer_region_indices(
+    groups: Sequence[tuple[Sequence[int], Sequence[int]]],
+) -> tuple[list[int], int]:
+    """Map field-major regions from local to global layer IDs.
+
+    Each group supplies ``(local_layer_ids, global_layer_ids)`` in allocation
+    order. Fields may cover different subsets of layers (e.g. an index cache).
+    Return the explicit consumer indices and the full consumer region count,
+    which is also the offset at which an independent draft pool starts.
+    """
+    indices, offset = [], 0
+    for local_layers, global_layers in groups:
+        slots = {layer: offset + i for i, layer in enumerate(global_layers)}
+        if len(slots) != len(global_layers):
+            raise ValueError("Global layer IDs must be unique within a region group")
+        if any(layer not in slots for layer in local_layers):
+            raise ValueError("Local region layers are missing from the global layout")
+        indices.extend(slots[layer] for layer in local_layers)
+        offset += len(global_layers)
+    return indices, offset
 
 
 def side_channel_port_offset(
