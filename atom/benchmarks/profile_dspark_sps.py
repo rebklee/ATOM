@@ -63,6 +63,19 @@ def main():
         parser.error("WORLD_SIZE must be divisible by --dp-size")
     if args.max_num_seqs < 1:
         parser.error("--max-num-seqs must be positive")
+    if args.dp_size > 1:
+        # Under DP with a drafter, decode graphs above this many rows are not
+        # captured; the sweep needs max_num_seqs x 6. Refuse before loading.
+        from atom.utils import envs
+
+        cap = envs.ATOM_TOKEN_GRAPH_DP_MAX_TOKENS
+        if args.max_num_seqs * 6 > cap:
+            parser.error(
+                f"--max-num-seqs {args.max_num_seqs} needs {args.max_num_seqs * 6}-row "
+                f"decode graphs, above ATOM_TOKEN_GRAPH_DP_MAX_TOKENS={cap} under DP; "
+                f"set ATOM_TOKEN_GRAPH_DP_MAX_TOKENS>={args.max_num_seqs * 6} or "
+                f"lower --max-num-seqs to {cap // 6}"
+            )
     parallel, tp_size, tp_rank = single_node_parallel_config(size, args.dp_size, rank)
     port = int(os.environ["MASTER_PORT"])
     config = Config(

@@ -114,3 +114,28 @@ def test_incompatible_or_invalid_profile_is_rejected(field, value):
     data[field] = value
     with pytest.raises(ValueError):
         validate_calibration(data, identity, width=5, max_batch=4)
+
+
+def test_dp_profiler_refuses_uncovered_graphs_before_loading(monkeypatch):
+    """`--dp-size 2` at 128 sequences needs 768-row decode graphs, above the
+    default DP cap of 512: fail on the arguments, not after loading."""
+    import sys
+
+    from atom.benchmarks import profile_dspark_sps as prof
+
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("ATOM_TOKEN_GRAPH_DP_MAX_TOKENS", "512")
+    monkeypatch.setattr(
+        prof, "ProfileRunner", lambda *a, **k: pytest.fail("loaded the model")
+    )
+    argv = ["prof", "--model", "m", "--output", "o.json", "--dp-size", "2"]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit):
+        prof.main()
+    monkeypatch.setattr(sys, "argv", argv + ["--max-num-seqs", "85"])
+    monkeypatch.setattr(
+        prof, "single_node_parallel_config", lambda *a: pytest.skip("past the check")
+    )
+    prof.main()
