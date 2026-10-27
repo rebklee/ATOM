@@ -68,15 +68,20 @@ the first difference without writing token values.
 ## Remaining validation limits
 
 - Actual EP/MoRI model execution and multi-node execution were not tested.
-- No DP SA throughput/latency run was performed. The earlier +3.26% TP2
-  observation belongs to its earlier evaluated snapshot, not this DP patch.
+- A concurrent TP1 x DP2, 128-lane SA A/B has now completed. Online SPS reduces
+  server output throughput/GPU by 6.45% in the 900-second window and increases
+  mean request TPOT by 13.50%; it does not show a gain on this configuration.
+  See [the full performance record](deepseek_v41_dspark_dp2_sa_results.md).
+  The earlier +3.26% TP2 observation belongs to its earlier snapshot and workload.
 - Whole-tree Black passes (1437 Python files), changed Python files pass Ruff,
   and `git diff --check` passes. Whole-tree Ruff still reports findings outside
   the changed Python files.
 - The full native unit suite stops during collection with 37 errors in the
   existing validation image. Missing dependencies include `jax`, `jsonschema`
   and `aiter.ops.triton.fused_fp8_quant`; GPU-driver-dependent imports also fail
-  when GPU visibility is disabled. The full suite is not green.
+  when GPU visibility is disabled. This local-image attempt is not green;
+  GitHub's Black, Ruff and non-GPU unit checks do pass on measured production
+  commit `eb96d53beafd100458a258760b90e6a298053218`.
 
 The new options remain disabled by default. See
 [the DSpark guide](deepseek_v41_dspark.md) for configuration and test commands.
