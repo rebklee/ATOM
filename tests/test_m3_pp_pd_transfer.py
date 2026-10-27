@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
 """MiniMax-M3 P/D from a PP prefill (TP1 stages) into a TP-sharded decode.
 
-The units are named by global layer and say how they split by KV head; the
-producer pairs a stage's regions with the decode's by name and writes each
-consumer rank its heads. The byte test drives the real descriptor builder
-against host buffers, so a wrong offset shows up as a wrong byte.
+The backend maps a stage's regions into the full consumer layout, including
+the appended draft. The byte test drives the real descriptor builder against
+host buffers, so a wrong region or head offset shows up as a wrong byte.
 """
 
 from types import SimpleNamespace
@@ -17,10 +16,15 @@ from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
 from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
+from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder
 
 aiter_attention = pytest.importorskip("atom.model_ops.attentions.aiter_attention")
 
 BLOCK, HEAD_DIM = 128, 128
+CONFIG = SimpleNamespace(
+    num_hidden_layers=8,
+    sparse_attention_config={"sparse_attention_freq": [1, 0, 1, 0, 0, 0, 1, 0]},
+)
 
 
 class _Layer:
@@ -29,7 +33,7 @@ class _Layer:
         self.impl = SimpleNamespace(is_indexed_sparse_attention=sparse)
 
 
-def _m3_builder(layer_nums, sparse, heads):
+def _m3_builder(layer_nums, sparse, heads, config=None, kv_dtype=torch.float8_e4m3fn):
     modules = [_Layer(n, s) for n, s in zip(layer_nums, sparse)]
     indexed = [m for m in modules if m.impl.is_indexed_sparse_attention]
     pool = MhaKvPool(
@@ -37,7 +41,7 @@ def _m3_builder(layer_nums, sparse, heads):
         block_size=BLOCK,
         num_kv_heads=heads,
         head_dim=HEAD_DIM,
-        kv_dtype=torch.float8_e4m3fn,
+        kv_dtype=kv_dtype,
         extra_fields=[EntryField("index", len(indexed), (BLOCK * 128,), torch.uint8)],
     )
     pool.allocate(4, "cpu")
@@ -48,14 +52,52 @@ def _m3_builder(layer_nums, sparse, heads):
         geometry: {m: row for row, m in enumerate(modules)},
         aiter_attention.INDEX_ROWS: {m: row for row, m in enumerate(indexed)},
     }
-    builder.model_runner = SimpleNamespace(block_size=BLOCK)
+    if config is None:
+        config = SimpleNamespace(
+            num_hidden_layers=60,
+            sparse_attention_config={"sparse_attention_freq": [0, 1] * 30},
+        )
+    builder.model_runner = SimpleNamespace(
+        block_size=BLOCK, config=SimpleNamespace(hf_config=config)
+    )
     builder._has_sparse_attention = True
     return builder
 
 
+def _draft_tensors(heads, kv_dtype=torch.float8_e4m3fn):
+    builder = object.__new__(DraftKvBuilder)
+    builder._kv_pool = MhaKvPool(
+        layers=2,
+        block_size=BLOCK,
+        num_kv_heads=heads,
+        head_dim=HEAD_DIM,
+        kv_dtype=kv_dtype,
+    )
+    builder._kv_pool.allocate(4, "cpu")
+    builder._pool_rows = {
+        DRAFT_KV_ROWS: {
+            type("Binding", (), {"shuffle_page_tokens": 16})(): row for row in range(2)
+        }
+    }
+    return builder.get_kv_transfer_tensors()
+
+
+def _transfer(layer_nums, heads, draft=False, kv_dtype=torch.float8_e4m3fn):
+    sparse = [
+        CONFIG.sparse_attention_config["sparse_attention_freq"][i] for i in layer_nums
+    ]
+    tt = _m3_builder(
+        layer_nums, sparse, heads, CONFIG, kv_dtype
+    ).get_kv_transfer_tensors()
+    if draft:
+        tt.merge_pages(_draft_tensors(heads, kv_dtype))
+    return tt
+
+
 def test_m3_units_are_named_by_global_layer_and_split_by_head():
     tt = _m3_builder([15, 16], [True, False], heads=4).get_kv_transfer_tensors()
-    assert tt.roles_are_global
+    assert tt.block_region_consumer_indices == [15, 16, 75, 76, 135, 136, 195, 196, 247]
+    assert tt.block_region_consumer_count == 270
     runs = {p.region.semantic_role: p.head_major_runs for p in tt.pages}
     assert runs["m3.layer_15.k"] == runs["m3.layer_15.v_scale"] == (8, 4)
     assert runs["m3.layer_16.v"] == (1, 4)  # dense: one page-128 run
@@ -64,6 +106,38 @@ def test_m3_units_are_named_by_global_layer_and_split_by_head():
     assert tt.tp_replication_factor == 1
     tt.set_block_count(4)
     assert len(_build_cache_views(tt, num_blocks=4).tensors) == len(tt.pages)
+
+
+@pytest.mark.parametrize("schedule", [{}, {"sparse_attention_freq": None}])
+def test_no_sparse_schedule_has_no_global_index_regions(schedule):
+    config = SimpleNamespace(
+        num_hidden_layers=3,
+        sparse_attention_config={"sparse_index_dim": 128, **schedule},
+    )
+    tt = _m3_builder([1], [False], 4, config).get_kv_transfer_tensors()
+    assert tt.block_region_consumer_indices == [1, 4, 7, 10]
+    assert tt.block_region_consumer_count == 12
+
+
+@pytest.mark.parametrize("heads", [1, 4])
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize(
+    "stages", [([0, 1], [2, 3], [4, 5], [6, 7]), ([0, 1, 2], [3, 4], [5, 6], [7])]
+)
+def test_every_stage_maps_into_the_full_consumer_layout(heads, kv_dtype, draft, stages):
+    consumer = _transfer(list(range(8)), 1, draft, kv_dtype)
+    roles = [r.semantic_role for r in consumer.block_regions]
+    all_indices = []
+    for held in stages:
+        tt = _transfer(held, heads, draft and held[-1] == 7, kv_dtype)
+        assert len(tt.block_region_consumer_indices) == len(tt.pages)
+        for page, idx in zip(tt.pages, tt.block_region_consumer_indices):
+            assert page.region.semantic_role == roles[idx]
+        all_indices.extend(tt.block_region_consumer_indices)
+    assert sorted(all_indices) == list(range(len(consumer.pages)))
+    assert consumer.block_region_consumer_count == len(consumer.pages)
+    assert consumer.block_region_consumer_indices == list(range(len(consumer.pages)))
 
 
 def test_page16_runs_are_how_the_sparse_writer_lays_heads_out():
@@ -86,6 +160,7 @@ class _Memory:
 
     def __init__(self):
         self.buffers, self.next = [], 1 << 40
+        self.writes = 0
 
     def add(self, nbytes, fill):
         buf = np.zeros(nbytes, np.uint8)
@@ -104,44 +179,53 @@ class _Memory:
         raise AssertionError(hex(addr))
 
     def write(self, srcs, dsts, sizes):
+        assert len(srcs) <= 7  # Exercise flushing during the head-cut path too.
+        self.writes += 1
         for s, d, n in zip(srcs, dsts, sizes):
             self.at(d, n)[:] = self.at(s, n)
 
 
-def _layer(n, heads):
-    kv, scale = heads * 8 * 2048, heads * 8 * 64
+def _layout(tt):
     return [
-        (f"m3.layer_{n}.k", (8, heads), kv),
-        (f"m3.layer_{n}.v_scale", (8, heads), scale),
-        (f"m3.layer_{n}.index", None, BLOCK * 128),
+        (p.region.semantic_role, p.head_major_runs, p.region.unit_bytes)
+        for p in tt.pages
     ]
 
 
-def test_tp1_stage_fills_each_tp4_rank_with_its_head():
+def _producer(tt, mem, blocks, heads):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
-    mem, blocks, src_ids, dst_ids = _Memory(), 6, [4, 1, 3], [0, 5, 2]
-    layout = _layer(15, 4) + _layer(16, 4)
+    layout = _layout(tt)
     producer = object.__new__(mc.MooncakeConnector)
     producer.__dict__.update(
         kv_caches_base_addr=[mem.add(blocks * b, True) for _, _, b in layout],
         _per_block_bytes_list=[b for _, _, b in layout],
         _block_region_roles=[r for r, _, _ in layout],
         _block_head_major_runs=[runs for _, runs, _ in layout],
-        _roles_are_global=True,
-        _block_region_consumer_indices=None,
-        tp_size=1,
+        _block_region_consumer_indices=tt.block_region_consumer_indices,
+        tp_size=4 // heads,
         dcp_size=1,
         pp_size=4,
         block_size=BLOCK,
         _mla_staging=None,
+        _MAX_RDMA_ENTRIES_PER_BATCH=7,
         _rdma_write=lambda target, s, d, n, *a, **k: mem.write(s, d, n) or True,
     )
+    return producer
+
+
+@pytest.mark.parametrize("heads", [1, 4])
+@pytest.mark.parametrize("held", [[0, 1], [2, 3], [4, 5], [6, 7], [7]])
+def test_stage_fills_each_tp4_rank_with_its_head(heads, held):
+    mem, blocks, src_ids, dst_ids = _Memory(), 4, [3, 1], [0, 2]
+    tt = _transfer(held, heads, draft=held[-1] == 7)
+    layout = _layout(tt)
+    producer = _producer(tt, mem, blocks, heads)
     consumers = []
     for rank in range(4):
-        # The decode holds every layer (and the draft), in its own order.
-        theirs = (_layer(14, 1) + _layer(15, 1) + _layer(16, 1))[::-1]
+        # Both layouts come from the real exporters. The consumer has all layers.
+        theirs = _layout(_transfer(list(range(8)), 1, draft=True))
         bases = [mem.add(blocks * b, False) for _, _, b in theirs]
         consumers.append({r: (a, b) for (r, _, b), a in zip(theirs, bases)})
         assert producer._execute_block_transfer(
@@ -164,23 +248,42 @@ def test_tp1_stage_fills_each_tp4_rank_with_its_head():
             dst_base, dst_bpb = regions[role]
             dst = mem.at(dst_base, blocks * dst_bpb).reshape(blocks, -1)
             for s, d in zip(src_ids, dst_ids):
-                want = src[s] if runs is None else src[s].reshape(8, 4, -1)[:, rank]
+                want = (
+                    src[s]
+                    if runs is None or heads == 1
+                    else src[s].reshape(runs[0], heads, -1)[:, rank]
+                )
                 assert np.array_equal(dst[d], want.ravel()), (role, rank)
-            assert not dst[[1, 3, 4]].any()
-    for regions in consumers:  # layer 14 is another stage's
-        assert not mem.at(*regions["m3.layer_14.k"]).any()
+            assert not dst[[1, 3]].any()
+    held_roles = {role for role, _, _ in layout}
+    for regions in consumers:
+        for role, (base, bpb) in regions.items():
+            if role not in held_roles:
+                assert not mem.at(base, blocks * bpb).any()
+    assert mem.writes > 4
 
 
-def test_role_pairing_refuses_a_consumer_without_the_region():
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
-    )
-    conn = object.__new__(mc.MooncakeConnector)
-    conn._block_region_roles = ["draft.k.layer_0", "m3.layer_59.k"]
-    assert conn._consumer_indices_by_role(["m3.layer_59.k", "draft.k.layer_0"]) == [
-        1,
-        0,
-    ]
-    for roles in (["m3.layer_59.k"], ["m3.layer_59.k", "m3.layer_59.k"]):
-        with pytest.raises(RuntimeError, match="Cannot pair"):
-            conn._consumer_indices_by_role(roles)
+@pytest.mark.parametrize("bad_layout", ["reordered", "missing_draft"])
+def test_incompatible_consumer_layout_is_refused(bad_layout):
+    mem = _Memory()
+    producer = _producer(_transfer([7], 4, draft=True), mem, 4, 4)
+    consumer = _transfer(list(range(8)), 1, draft=True)
+    roles = [r.semantic_role for r in consumer.block_regions]
+    bases = [0] * len(roles)
+    if bad_layout == "reordered":
+        roles.reverse()
+    else:
+        bases = bases[:-1]
+    with pytest.raises((RuntimeError, ValueError), match="role mismatch|exceeds"):
+        producer._execute_block_transfer(
+            {
+                "consumer_base_addrs": bases,
+                "consumer_region_roles": roles,
+                "consumer_tp_size": 1,
+            },
+            "consumer",
+            [0],
+            [0],
+            "bad-layout",
+        )
+    assert mem.writes == 0

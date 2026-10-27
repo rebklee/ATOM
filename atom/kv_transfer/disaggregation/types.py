@@ -305,9 +305,10 @@ class KVTransferTensors:
     # those are ordinary PAGE KV, never part of the state image. None means
     # every region. Appended for positional compatibility.
     paged_state_region_count: int | None = None
-    # Every PAGE role names one region of the whole model, not of this PP
-    # stage, so a stage pairs its regions with the consumer's by role.
-    roles_are_global: bool = False
+    # Full consumer region count for this contributor, including other PP
+    # stages. Appended draft regions start here, not after this stage's pages.
+    # Required when merging a contributor with explicit consumer indices.
+    block_region_consumer_count: int | None = None
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is
@@ -337,11 +338,29 @@ class KVTransferTensors:
         """
         if not other.pages:
             return
+        if (
+            self.block_region_consumer_indices is not None
+            or other.block_region_consumer_indices is not None
+        ):
+            indices, offset = [], 0
+            for contributor in (self, other):
+                local = contributor.block_region_consumer_indices
+                count = contributor.block_region_consumer_count
+                if local is None:
+                    local = range(len(contributor.pages))
+                    count = len(contributor.pages)
+                elif count is None:
+                    raise ValueError(
+                        "Merging mapped PAGE regions needs their full consumer count"
+                    )
+                indices.extend(offset + i for i in local)
+                offset += count
+            self.block_region_consumer_indices = indices
+            self.block_region_consumer_count = offset
         self.pages.extend(other.pages)
         self.tp_replication_factor = math.gcd(
             self.tp_replication_factor, other.tp_replication_factor
         )
-        self.roles_are_global = self.roles_are_global and other.roles_are_global
 
     def set_block_count(self, num_blocks: int) -> None:
         """Fix the block id space, and check every region is in it.

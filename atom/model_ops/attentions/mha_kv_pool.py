@@ -285,9 +285,9 @@ class MhaKvPool:
 
         Named for the reader, and parsed as `{field}.layer_{row}` by the
         exports that name their units globally (MiniMax-M3's, a paged
-        draft's), which the connector pairs by role; otherwise the mooncake
-        connector pairs the two ends by list position and only checks the
-        role. What a name buys is that `set_block_count`'s refusal says which
+        draft's). The connector uses consumer indices to pair the two ends
+        and checks the role at the mapped position. What a name buys is that
+        `set_block_count`'s refusal says which
         region is wrong -- `k` of layer 12, not region 37 -- and the folded
         order (all of K, then all of V) makes that worth having.
         """

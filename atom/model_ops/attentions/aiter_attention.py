@@ -779,11 +779,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if not self.kv_pools:
             return None
         if self._has_sparse_attention:
-            return KVTransferTensors(
-                pages=self._minimax_m3_transfer_pages(),
-                tp_replication_factor=1,
-                roles_are_global=True,
-            )
+            return self._minimax_m3_transfer_tensors()
         return KVTransferTensors(
             # Every field of every pool, indexer cache included: a unit per
             # (pool, field, layer), in declared order. The geometry is in the
@@ -800,17 +796,37 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             tp_replication_factor=1,
         )
 
-    def _minimax_m3_transfer_pages(self) -> list:
-        """MiniMax-M3's PAGE units, named by global layer so a PP stage pairs
-        them with the decode's, and split by KV head so a TP1 stage can hand a
-        TP-sharded decode rank its own: a sparse layer writes through page-16
-        SHUFFLE views (`to_page16_shuffle`), so each run is 16 tokens, a dense
-        layer's one pool block. The indexer key is replicated, moved whole."""
+    def _minimax_m3_transfer_tensors(self):
+        """Publish M3 pages and their explicit consumer indices, as MLA does.
+
+        The consumer lists each KV/scale field over all layers, then compact
+        index-cache rows over sparse layers. A stage contributes only its rows.
+        Sparse KV uses page-16 SHUFFLE runs; the indexer key moves whole.
+        """
         from atom.kv_transfer.disaggregation.page_region import page_region
+        from atom.kv_transfer.disaggregation.types import KVTransferTensors
         from atom.model_ops.minimax_m3.sparse_attn import ASM_PAGE_SIZE
 
+        config = self.model_runner.config.hf_config
+        config = getattr(config, "text_config", config)
+        num_layers = config.num_hidden_layers
+        sparse_layers = [
+            i
+            for i, enabled in enumerate(
+                config.sparse_attention_config.get("sparse_attention_freq") or ()
+            )
+            if enabled
+        ]
+        index_slots = {layer: row for row, layer in enumerate(sparse_layers)}
+        # M3's dense and sparse layers use the same KV-head geometry.
+        if len(self.kv_pools) != 1:
+            raise ValueError("MiniMax-M3 transfer expects one KV-head geometry")
+        pool = next(iter(self.kv_pools.values()))
+        fields = pool.cache_fields + pool.scale_fields
+        field_offsets = {f.name: i * num_layers for i, f in enumerate(fields)}
+        index_offset = len(fields) * num_layers
         index_layers = {r: m for m, r in self.pool_rows.get(INDEX_ROWS, {}).items()}
-        pages = []
+        pages, consumer_indices = [], []
         for geometry, pool in self.kv_pools.items():
             kv_layers = {r: m for m, r in self.pool_rows[geometry].items()}
             for role, tensor in pool.region_tensors():
@@ -818,8 +834,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 runs = None
                 if field == "index":
                     module = index_layers[int(row)]
+                    consumer_index = index_offset + index_slots[module.layer_num]
                 else:
                     module = kv_layers[int(row)]
+                    consumer_index = field_offsets[field] + module.layer_num
                     sparse = _is_indexed_sparse_attention(module)
                     page = ASM_PAGE_SIZE if sparse else pool.block_size
                     runs = (self.model_runner.block_size // page, pool.num_kv_heads)
@@ -830,7 +848,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                         head_major_runs=runs,
                     )
                 )
-        return pages
+                consumer_indices.append(consumer_index)
+        return KVTransferTensors(
+            pages=pages,
+            block_region_consumer_indices=consumer_indices,
+            block_region_consumer_count=index_offset + len(sparse_layers),
+            tp_replication_factor=1,
+        )
 
     def refresh_flydsl_plan(self, context_lens, *, create=False):
         """Build or refresh aiter's FlyDSL work plan for this forward.

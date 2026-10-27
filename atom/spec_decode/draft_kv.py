@@ -219,6 +219,4 @@ class DraftKvBuilder(PoolRowsMixin):
             # A paged MHA/GQA draft is a per-rank shard. Appending it to an
             # otherwise replicated target must disable whole-object collapse.
             tp_replication_factor=1,
-            # The draft stack exists once (on the last PP stage): rows are global.
-            roles_are_global=True,
         )

@@ -5,8 +5,6 @@ import pytest
 import torch
 
 from atom.kv_transfer.disaggregation.mha_head_transfer import consumer_head_slices
-from atom.kv_transfer.disaggregation.page_region import page_region
-from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
 
 @pytest.mark.parametrize("runs", [1, 8])
@@ -44,14 +42,3 @@ def test_a_unit_that_is_not_per_head_moves_whole():
 def test_geometry_the_two_ends_cannot_share_is_refused(args):
     with pytest.raises(ValueError):
         consumer_head_slices(*args)
-
-
-def test_one_stage_local_contributor_makes_roles_unpairable():
-    def tensors(global_roles):
-        page = page_region(torch.zeros(2, 64, dtype=torch.uint8), semantic_role="r")
-        return KVTransferTensors(pages=[page], roles_are_global=global_roles)
-
-    both, mixed = tensors(True), tensors(True)
-    both.merge_pages(tensors(True))
-    mixed.merge_pages(tensors(False))
-    assert both.roles_are_global and not mixed.roles_are_global

@@ -694,9 +694,8 @@ class MooncakeConnector(KVConnectorBase):
     # ``__init__`` aborted before the matched-rail block; both must fall back to
     # the single shared ``transfer_engine`` instead of raising AttributeError.
     _rail_pool: RailEnginePool | None = None
-    # Set by `register_kv_caches`; until then nothing is cut or paired by role.
+    # Set by `register_kv_caches`; until then no units are cut by head.
     _block_head_major_runs: tuple = ()
-    _roles_are_global: bool = False
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -1149,7 +1148,6 @@ class MooncakeConnector(KVConnectorBase):
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
         self._block_region_roles = [r.semantic_role for r in tt.block_regions]
         self._block_head_major_runs = tuple(page.head_major_runs for page in tt.pages)
-        self._roles_are_global = tt.roles_are_global
         self._fp4_index_layout = any(
             role is not None and role.startswith(INDEX_CACHE_FP4_PREFIX)
             for role in self._block_region_roles
@@ -2337,6 +2335,10 @@ class MooncakeConnector(KVConnectorBase):
                     "Explicit consumer region map length does not match local "
                     f"regions: {len(explicit_indices)} != {num_local_regions}"
                 )
+            if any(not 0 <= i < num_consumer_regions for i in explicit_indices):
+                raise ValueError(
+                    "Explicit consumer region map exceeds consumer regions"
+                )
             return explicit_indices
         if (
             consumer_num_layers is not None
@@ -2371,18 +2373,6 @@ class MooncakeConnector(KVConnectorBase):
                 "agree on speculative decode (a draft KV layer widens every group)."
             )
         return cmap
-
-    def _consumer_indices_by_role(self, consumer_roles: list | None) -> list[int]:
-        """Each block region's consumer index, found by its global role: a PP
-        stage holds only some of the regions, so its positions say nothing."""
-        by_role = {role: idx for idx, role in enumerate(consumer_roles or [])}
-        missing = [role for role in self._block_region_roles if role not in by_role]
-        if missing or len(by_role) != len(consumer_roles):
-            raise RuntimeError(
-                "Cannot pair block regions by role: the consumer's roles are not "
-                f"unique or lack {missing[:3]}"
-            )
-        return [by_role[role] for role in self._block_region_roles]
 
     def _consumer_head_cut(self, request_data: dict, consumer_dcp_size: int):
         """``(consumer head runs, consumer rank, consumer TP)`` when a consumer
@@ -2475,11 +2465,7 @@ class MooncakeConnector(KVConnectorBase):
             num_regions,
             len(consumer_base_addrs),
             request_data.get("consumer_num_layers"),
-            (
-                self._consumer_indices_by_role(consumer_roles)
-                if self._roles_are_global
-                else self._block_region_consumer_indices
-            ),
+            self._block_region_consumer_indices,
         )
         # Under DCP the consumer rank owns only part of each block, so
         # whole-block descriptors no longer line up and the push becomes the
