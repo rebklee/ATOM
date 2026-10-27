@@ -79,6 +79,7 @@ class DSparkRuntime:
         self.update_interval = cfg.online_sps_update_interval
         self.mesh = mesh
         self.dp_state = None
+        self.dp_planner = None
         if runner.config.parallel_config.data_parallel_size > 1 and mesh is None:
             from atom.spec_decode.dspark_dp import SPSMesh
 
@@ -235,10 +236,11 @@ class DSparkRuntime:
             if self.rank == 0 and (
                 self.model.version == 1 or self.model.version % 16 == 0
             ):
-                logger.info(
-                    "DSpark online SPS %s",
-                    json.dumps(self.model.snapshot(), sort_keys=True),
-                )
+                snapshot = self.model.snapshot()
+                if self.dp_planner is not None:
+                    snapshot["dp_planned"] = self.dp_planner.planned
+                    snapshot["dp_contracted"] = self.dp_planner.contracted
+                logger.info("DSpark online SPS %s", json.dumps(snapshot, sort_keys=True))
         # All ranks retire this epoch, including incomplete/unmatched samples.
         # Unfinished events stay owned until query() permits reuse.
         self.cutoff = self.step - 1

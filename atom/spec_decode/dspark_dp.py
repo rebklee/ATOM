@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """DP verification budgets from fixed N-2 confidence and group execution costs.
 
-The CPU planner runs before ForwardMode's shape agreement on EVERY forward.
+The CPU planner runs on EVERY forward. Its payload rides ForwardMode's one DP
+exchange (`sync_dp_metadata`), and every rank resolves the same plan from it.
 Only delayed survival probabilities leave the GPU; request ids remain local.
 The planner includes today's bonus floors before comparing executable graphs.
 """
@@ -32,6 +33,7 @@ class SPSMesh:
         self.tp_size = dist.get_world_size(tp_group)
         self.tp_rank = dist.get_rank(tp_group)
         self.dp_size = dist.get_world_size(dp_group)
+        self.dp_rank = dist.get_rank(dp_group)
 
     @staticmethod
     def gather(value, group, size):
@@ -204,6 +206,8 @@ class DPVerifyPlanner:
         self.planned = 0
         self.contracted = 0
         self.selected_q = None
+        self._ids = ()
+        self._lengths = None
 
     def capture(self, confidence):
         if self.mesh.tp_rank == 0:
@@ -271,14 +275,19 @@ class DPVerifyPlanner:
         ]
 
     def prepare(self, batch):
-        """Called on real, dummy, prefill, and output-less forward paths alike."""
+        """This rank's planning payload, built on real, dummy, prefill and
+        output-less forwards alike. It rides the step's one DP exchange
+        (`sync_dp_metadata`); `resolve` turns every rank's payload into the plan.
+        """
         from atom.utils.region_graph import TokenGraph
 
         self.epoch += 1
         self.selected_q = None
         self.survival = None
+        self._lengths = None
         n = batch.total_seqs_num
         ids = tuple(batch.req_ids[:n])
+        self._ids = ids
         if ids != self._request_set:
             self._local_context += 1
             self._request_set = ids
@@ -315,7 +324,7 @@ class DPVerifyPlanner:
             ).astype(np.int64)
             + 1
         )
-        frontier, lengths = (
+        frontier, self._lengths = (
             local_frontier(
                 survival, floors, ceilings, self.candidates, self.qs, dummy=dummy
             )
@@ -336,8 +345,15 @@ class DPVerifyPlanner:
             ],
             dtype=np.float64,
         )
-        wire = torch.from_numpy(np.concatenate((header, frontier.reshape(-1))))
-        gathered = self.mesh.gather_dp(wire).numpy()
+        return np.concatenate((header, frontier.reshape(-1)))
+
+    def resolve(self, gathered):
+        """The group's plan from every rank's `prepare` payload ([dp, len]).
+
+        Identical on every rank, since every rank holds the same rows. Returns
+        ``(q, chosen graph rows per rank)`` and leaves this rank's lengths in
+        the scheduler's ell map, or None to keep the scheduled widths.
+        """
         headers = gathered[:, :8]
         if not (headers[:, 6] == self.epoch).all():
             raise RuntimeError("DSpark DP forward epochs diverged")
@@ -352,9 +368,10 @@ class DPVerifyPlanner:
         runtime = self.scheduler.runtime
         if runtime is not None:
             runtime.dp_state = self.state
+            runtime.dp_planner = self
         self.scheduler._ell_map = {}  # invalid generations never inherit a plan
-        if not self.state.pure_decode or not headers[:, 3].all() or not captured:
-            return
+        if not self.state.pure_decode or not headers[:, 3].all() or not self._captured:
+            return None
         model = runtime.model if runtime is not None and not self.observe_only else None
         cost = (
             (lambda g: model.estimate_ms(g, self.state.batch))
@@ -362,14 +379,19 @@ class DPVerifyPlanner:
             else (lambda g: self.baseline_ms[g])
         )
         self.planned += 1
+        frontiers = gathered[:, 8:].reshape(self.mesh.dp_size, -1, 4)
         choice = choose_dp_candidate(
-            gathered[:, 8:].reshape(self.mesh.dp_size, -1, 4),
-            captured,
+            frontiers,
+            self._captured,
             int(headers[:, 4].max()),
             int(headers[:, 5].max()),
             cost,
         )
-        if choice is not None:
-            self.contracted += 1
-            self.selected_q = self.candidates[choice][0]
-            self.scheduler._ell_map = dict(zip(ids, (lengths[choice] - 1).tolist()))
+        if choice is None:
+            return None
+        self.contracted += 1
+        self.selected_q = self.candidates[choice][0]
+        self.scheduler._ell_map = dict(
+            zip(self._ids, (self._lengths[choice] - 1).tolist())
+        )
+        return self.selected_q, frontiers[:, choice, 1].astype(np.int64)

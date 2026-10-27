@@ -220,7 +220,7 @@ def test_observe_only_keeps_the_joint_static_budget(tmp_path, monkeypatch):
         planner.epoch = 2
         survival = torch.tensor([[0.35**i for i in range(1, 6)]])
         planner.pending = [(1, NS(synchronize=lambda: None), survival, (7,), survival)]
-        planner.prepare(
+        wire = planner.prepare(
             NS(
                 total_seqs_num=1,
                 req_ids=(7,),
@@ -231,7 +231,13 @@ def test_observe_only_keeps_the_joint_static_budget(tmp_path, monkeypatch):
                 num_bonus=np.array([0]),
             )
         )
+        # Two identical ranks: the payload is what sync_dp_metadata gathers.
+        plan = planner.resolve(np.stack([wire, wire]))
         selected.append(scheduler._ell_map.get(7, 5))
+        if plan is not None:
+            q, tokens = plan
+            assert q == planner.selected_q
+            assert tokens.tolist() == [scheduler._ell_map[7] + 1] * 2
     # Static: q=1 wins (1/1.5). Adding 20 ms shifts the optimum to
     # q=3 (1.4725/22.5), ahead of q=6 (~1.5356/24).
     assert selected == [0, 2]

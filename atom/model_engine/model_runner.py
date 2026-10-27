@@ -2407,6 +2407,28 @@ class ModelRunner:
             ),
         )
 
+    def _dspark_apply_dp_plan(self, batch, planner, gathered):
+        """Resolve DSpark's joint DP plan from every rank's payload and shrink
+        this rank's batch to its share; ``(q, tokens per rank)`` or None.
+
+        The ragged rewrite reproduces the planner's per-request lengths exactly
+        (they sit between ``num_bonus + 1`` and the scheduled width), so the
+        rows every peer assumed for this rank are the rows it now runs. A
+        difference would hand the group two shapes, so it is fatal here rather
+        than a hang inside the collectives.
+        """
+        planned = planner.resolve(gathered)
+        if planned is None:
+            return None
+        q, tokens = planned
+        self._dspark_apply_q_bucket(batch)
+        if int(batch.total_tokens_num) != int(tokens[planner.mesh.dp_rank]):
+            raise RuntimeError(
+                f"DSpark DP plan expects {int(tokens[planner.mesh.dp_rank])} "
+                f"tokens on this rank, the ragged layout has {batch.total_tokens_num}"
+            )
+        return q, tokens
+
     def _dspark_apply_ragged(self, batch, scheduled_bs, full_q, by_req):
         """DSpark per-request RAGGED verify (paper §5.2 avoid-padding).
 
@@ -2713,17 +2735,25 @@ class ModelRunner:
     def prepare_model(self, batch: ScheduledBatch):
         verify = getattr(getattr(self, "drafter", None), "verify_scheduler", None)
         dp_planner = getattr(verify, "dp", None)
+        dp_plan = None
         if dp_planner is not None:
             # Unconditional with respect to local batch type and dummy/output
-            # state, before both the ragged mutation and DP shape agreement.
-            dp_planner.prepare(batch)
-        shrunk_q = self._dspark_apply_q_bucket(batch)
+            # state. The payload rides ForwardMode's DP exchange; the ragged
+            # mutation runs inside it, once every rank's frontier is known.
+            dp_plan = (
+                dp_planner.prepare(batch),
+                lambda gathered: self._dspark_apply_dp_plan(
+                    batch, dp_planner, gathered
+                ),
+            )
+        shrunk_q = (
+            None if dp_planner is not None else self._dspark_apply_q_bucket(batch)
+        )
         # The step's shape, settled once. Here rather than in prepare_inputs
         # because DSpark under DP needs the reduced query length BEFORE
         # prepare_input_ids sizes the buffer, and because one call site is the
         # only way the step is guaranteed a single cross-DP collective.
         dp_size = self.config.parallel_config.data_parallel_size
-        planned_q = getattr(dp_planner, "selected_q", None)
         forward_mode = ForwardMode.decide(
             batch=batch,
             dp_size=dp_size,
@@ -2736,14 +2766,11 @@ class ModelRunner:
             ),
             tbo_on=self.config.enable_tbo,
             local_tbo=self._local_tbo_eligibility(batch),
-            max_seqlen_q=(
-                planned_q
-                if planned_q is not None
-                else (batch.num_spec_step + 1 if shrunk_q is None else shrunk_q)
-            ),
+            max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
             running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
             graph_shapes=self._producer_graph_shapes(),
             tbo_decode_graphs=self.tbo_decode_graphs,
+            dp_plan=dp_plan,
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
