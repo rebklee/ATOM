@@ -4414,6 +4414,32 @@ class ModelRunner:
             return
         if verify_scheduler.calibration_profile is not None:
             return  # Explicit offline measurements must not be overwritten.
+        dspark = self.config.dspark
+        if (
+            dspark.ragged
+            and drafter.uses_confidence_schedule
+            and (
+                dspark.online_sps
+                or dspark.bucket_global
+                or self.config.hf_config.model_type == "deepseek_v41_text"
+            )
+        ):
+            # A measured curve is required here (V4.1 admits no stub; online
+            # SPS corrects a measured baseline). Ragged verification runs on
+            # decode token graphs: time those now, before the first request,
+            # as DeepInfer's startup profile does. Capture already ran these
+            # graphs on the same synthetic metadata, so no request state exists
+            # yet for the replays to disturb.
+            from atom.spec_decode.startup_sps import startup_sps_table
+
+            verify_scheduler.bind_sps(
+                startup_sps_table(
+                    self,
+                    self._dspark_capture_q_buckets(max_q_len),
+                    self.config.max_num_seqs * max_q_len,
+                )
+            )
+            return
         if self.req_graph is None or not self.req_graph.keys():
             return
         if self.config.dspark.disable_sps_calib:

@@ -7,7 +7,6 @@ import itertools
 import json
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -69,12 +68,10 @@ class DSparkRuntime:
         validate_online_runtime(runner.config)
         self.runner = runner
         cfg = runner.config.dspark
-        profile = json.loads(Path(cfg.calibration_profile).read_text(encoding="utf-8"))
-        self.model = OnlineSPS(
-            profile["sps_table"],
-            runner.config.max_num_seqs,
-            window=cfg.online_sps_window_steps,
-        )
+        # Bound to the measured curve by VerifyScheduler.bind_sps: from the
+        # offline profile at construction, or after graph capture.
+        self.model = None
+        self._window = cfg.online_sps_window_steps
         self.sample_interval = cfg.online_sps_sample_interval
         self.update_interval = cfg.online_sps_update_interval
         self.mesh = mesh
@@ -107,11 +104,19 @@ class DSparkRuntime:
         self._send = torch.zeros((MAX_PENDING, 6), dtype=torch.float64, device="cpu")
         self._recv = [torch.empty_like(self._send) for _ in range(self.world_size)]
 
+    def bind(self, baseline_sps):
+        self.model = OnlineSPS(
+            baseline_sps, self.runner.config.max_num_seqs, window=self._window
+        )
+        self.table_cache.clear()
+
     def begin(self, batch, forward_mode):
         # Under DP the planner publishes a group-wide decode predicate and a
         # request-set generation before shape agreement. Dummy ranks take part
         # in both timing and publication; mixed P/D steps take part in neither.
         dp = self.dp_state
+        if self.model is None:
+            return None  # warmup and capture run before the curve exists
         if self.mesh is not None and (dp is None or not dp.pure_decode):
             return None
         if (
@@ -240,13 +245,15 @@ class DSparkRuntime:
                 if self.dp_planner is not None:
                     snapshot["dp_planned"] = self.dp_planner.planned
                     snapshot["dp_contracted"] = self.dp_planner.contracted
-                logger.info("DSpark online SPS %s", json.dumps(snapshot, sort_keys=True))
+                logger.info(
+                    "DSpark online SPS %s", json.dumps(snapshot, sort_keys=True)
+                )
         # All ranks retire this epoch, including incomplete/unmatched samples.
         # Unfinished events stay owned until query() permits reuse.
         self.cutoff = self.step - 1
 
     def table(self, base_sps, batch):
-        if self.model.version == 0:
+        if self.model is None or self.model.version == 0:
             return base_sps
         if batch not in self.table_cache:
             rows = torch.arange(
@@ -263,7 +270,7 @@ class DSparkRuntime:
 
     def snapshot(self):
         return {
-            **self.model.snapshot(),
+            **(self.model.snapshot() if self.model is not None else {}),
             "decode_steps": self.step,
             "pending": len(self.pending),
             "skipped_busy": self.skipped_busy,

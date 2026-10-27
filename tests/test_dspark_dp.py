@@ -217,6 +217,7 @@ def test_observe_only_keeps_the_joint_static_budget(tmp_path, monkeypatch):
             gather_dp=lambda x: torch.stack([x, x]),
         )
         planner = DPVerifyPlanner(scheduler, mesh=mesh)
+        planner.bind(baseline)
         planner.epoch = 2
         survival = torch.tensor([[0.35**i for i in range(1, 6)]])
         planner.pending = [(1, NS(synchronize=lambda: None), survival, (7,), survival)]

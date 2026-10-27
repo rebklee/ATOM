@@ -1043,6 +1043,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # forward/draft/commit to append confidence/acceptance records to this
     # directory (`atom/benchmarks/dspark_capture.py`). Synchronizes on every
     # sampled step; never set it on a serving deployment being measured.
+    # Where DSpark's startup SPS sweep caches its per-deployment measurements
+    # (`atom/spec_decode/startup_sps.py`), keyed by the deployment identity.
+    # Unset: ~/.cache/atom/dspark_sps. Empty: measure on every start.
+    "ATOM_DSPARK_SPS_CACHE_DIR": lambda: os.getenv("ATOM_DSPARK_SPS_CACHE_DIR"),
     "ATOM_DSPARK_CALIBRATION_DIR": lambda: (
         os.getenv("ATOM_DSPARK_CALIBRATION_DIR") or None
     ),

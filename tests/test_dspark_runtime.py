@@ -1,4 +1,3 @@
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -32,17 +31,12 @@ class Event:
 
 
 @pytest.fixture
-def runtime(tmp_path, monkeypatch):
-    path = tmp_path / "profile.json"
-    path.write_text(
-        json.dumps({"sps_table": [1000 / (1 + i * 0.1) for i in range(49)]})
-    )
+def runtime(monkeypatch):
     config = SimpleNamespace(
         dspark=DSparkConfig(
             online_sps=True,
             confidence_schedule=True,
             ragged=True,
-            calibration_profile=str(path),
             online_sps_sample_interval=2,
             online_sps_update_interval=16,
         ),
@@ -57,9 +51,20 @@ def runtime(tmp_path, monkeypatch):
         enforce_eager=False,
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    return DSparkRuntime(
+    rt = DSparkRuntime(
         SimpleNamespace(config=config), group=object(), event_factory=Event
     )
+    # What VerifyScheduler.bind_sps hands it: offline profile or startup sweep.
+    rt.bind([1000 / (1 + i * 0.1) for i in range(49)])
+    return rt
+
+
+def test_nothing_is_timed_before_a_curve_is_bound(runtime):
+    """Warmup and capture forwards run before the startup sweep binds a curve."""
+    runtime.model = None
+    assert runtime.begin(batch(req_ids=[1]), MODE) is None
+    assert runtime.step == 0
+    assert runtime.table("base", 1) == "base"
 
 
 def batch(**overrides):

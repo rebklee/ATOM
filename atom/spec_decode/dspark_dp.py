@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -176,12 +175,13 @@ class DPVerifyPlanner:
         self.mesh = mesh or SPSMesh()
         self.gamma = config.speculative_config.num_speculative_tokens
         self.qs = resolve_q_buckets(config.dspark.ragged_graph_sizes, self.gamma + 1)
-        profile = json.loads(Path(config.dspark.calibration_profile).read_text())
-        self.baseline_ms = np.array([1000.0 / x for x in profile["sps_table"]])
+        # The measured curve arrives through `bind` (offline profile at
+        # construction, or the startup sweep after graph capture). Until then
+        # no decode graph is plannable and every step keeps its full width.
+        self.baseline_ms = None
         self.observe_only = config.dspark.online_sps_observe_only
         self.mesh.agree(
             (
-                profile,
                 self.qs,
                 config.max_num_seqs,
                 self.observe_only,
@@ -208,6 +208,13 @@ class DPVerifyPlanner:
         self.selected_q = None
         self._ids = ()
         self._lengths = None
+
+    def bind(self, baseline_sps):
+        # Every worker must plan with the same curve; a startup sweep reduces
+        # its timings by MAX over TP and DP, so this only catches divergence.
+        self.mesh.agree([round(float(x), 6) for x in baseline_sps])
+        self.baseline_ms = np.array([1000.0 / x for x in baseline_sps])
+        self._captured = None
 
     def capture(self, confidence):
         if self.mesh.tp_rank == 0:
@@ -291,8 +298,14 @@ class DPVerifyPlanner:
         if ids != self._request_set:
             self._local_context += 1
             self._request_set = ids
-        captured = tuple(
-            g for g in TokenGraph.captured_sizes("decode") if g < len(self.baseline_ms)
+        captured = (
+            tuple(
+                g
+                for g in TokenGraph.captured_sizes("decode")
+                if g < len(self.baseline_ms)
+            )
+            if self.baseline_ms is not None
+            else ()
         )
         if captured != self._captured:
             self.mesh.agree(captured)

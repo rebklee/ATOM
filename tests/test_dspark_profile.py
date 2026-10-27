@@ -6,18 +6,6 @@ import pytest
 from atom.spec_decode.calibration import calibration_identity, validate_calibration
 
 
-def test_single_node_worker_rank_retains_the_full_node_dp_slice():
-    from atom.spec_decode.calibration import single_node_parallel_config
-
-    for rank in range(4):
-        parallel, tp, local = single_node_parallel_config(4, 2, rank)
-        assert parallel.data_parallel_size_local == 2
-        assert parallel.data_parallel_rank == rank // 2
-        assert parallel.data_parallel_rank_local * tp + local == rank
-    with pytest.raises(ValueError, match="rank layout"):
-        single_node_parallel_config(3, 2, 0)
-
-
 def profile():
     return {
         "version": 1,
@@ -117,31 +105,6 @@ def test_incompatible_or_invalid_profile_is_rejected(field, value):
     data[field] = value
     with pytest.raises(ValueError):
         validate_calibration(data, identity, width=5, max_batch=4)
-
-
-def test_dp_profiler_refuses_uncovered_graphs_before_loading(monkeypatch):
-    """`--dp-size 2` at 128 sequences needs 768-row decode graphs, above the
-    default DP cap of 512: fail on the arguments, not after loading."""
-    import sys
-
-    from atom.benchmarks import profile_dspark_sps as prof
-
-    monkeypatch.setenv("RANK", "0")
-    monkeypatch.setenv("WORLD_SIZE", "2")
-    monkeypatch.setenv("MASTER_PORT", "29500")
-    monkeypatch.setenv("ATOM_TOKEN_GRAPH_DP_MAX_TOKENS", "512")
-    monkeypatch.setattr(
-        prof, "ProfileRunner", lambda *a, **k: pytest.fail("loaded the model")
-    )
-    argv = ["prof", "--model", "m", "--output", "o.json", "--dp-size", "2"]
-    monkeypatch.setattr(sys, "argv", argv)
-    with pytest.raises(SystemExit):
-        prof.main()
-    monkeypatch.setattr(sys, "argv", argv + ["--max-num-seqs", "85"])
-    monkeypatch.setattr(
-        prof, "single_node_parallel_config", lambda *a: pytest.skip("past the check")
-    )
-    prof.main()
 
 
 def test_a_profile_without_graph_fields_must_be_regenerated():

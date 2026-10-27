@@ -69,6 +69,8 @@ class VerifyScheduler:
             from atom.spec_decode.dspark_dp import DPVerifyPlanner
 
             self.dp = DPVerifyPlanner(self)
+        if self.sps_table is not None:
+            self.bind_sps(self.sps_table)
         self._last_ell: torch.Tensor | None = None
         # FIFO of in-flight async D2H copies of ell, one entry per step:
         # (event, cpu_buf, req_ids). Read by index in _resolve_ell, never popped.
@@ -265,6 +267,16 @@ class VerifyScheduler:
         self._ell_pending.append((event, cpu_buf, list(req_ids)))
         if len(self._ell_pending) > _MAX_ELL_INFLIGHT:
             del self._ell_pending[:-_MAX_ELL_INFLIGHT]
+
+    def bind_sps(self, sps_table: torch.Tensor) -> None:
+        """Adopt the measured cost curve (offline profile or startup sweep)
+        and hand it to the online estimator and the DP planner as baseline."""
+        self.sps_table = sps_table
+        values = sps_table.detach().float().cpu().tolist()
+        if self.runtime is not None:
+            self.runtime.bind(values)
+        if self.dp is not None:
+            self.dp.bind(values)
 
     def _resolve_ell(self) -> None:
         """Adopt the ell from a FIXED generation back (``_ELL_GENERATION``).

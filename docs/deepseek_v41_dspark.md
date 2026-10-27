@@ -101,43 +101,44 @@ Model math lives in `models/deepseek_v41/dspark.py` and
 backend. Generic speculation code owns proposal execution, confidence scheduling
 and sampling, without Engram hash or CSA2 compression formulas.
 
-## Dynamic verification and its calibration profile
+## Dynamic verification and its cost curve
 
 Dynamic verification requires `DSparkConfig(confidence_schedule=True,
-ragged=True, calibration_profile="/path/to/profile.json")`. No V4 SPS curve or
-synthetic cost stub is admitted for V4.1, and an explicit profile takes
-precedence over automatic warmup calibration.
+ragged=True)`. No V4 SPS curve or synthetic cost stub is admitted for V4.1: the
+scheduler needs a measured **SPS table**, mapping total query rows to
+target-forward throughput. It comes from one of two places.
 
-A profile carries two fitted objects. **Confidence temperatures** rescale the
-drafter's per-position survival probabilities; they are fitted against
-cumulative-survival ECE on training blocks and evaluated on held-out request
-hashes. **An SPS table** maps total query
-rows to target-forward throughput, aggregated from max-rank CUDA-event medians
-and converted to a conservative monotone latency envelope before interpolation.
-This one-dimensional cost model does not capture context or routing variation.
+**Measured at startup (default).** Right after the decode token graphs are
+captured, before the server accepts a request, every captured (batch, q) decode
+graph is replayed and timed, as DeepInfer's startup `profile_decode_perf` does
+(`atom/spec_decode/startup_sps.py`). The replays use the synthetic metadata
+capture itself used, so no request state exists for them to disturb. Each
+shape takes 3 warmup and 15 timed target forwards (including eager regions and
+the LM head); the median is reduced by MAX over TP and DP, since the slowest
+rank sets the step. The points become a conservative monotone latency envelope,
+interpolated per row; rows past the largest recorded graph (a DP graph cap)
+extend along the last measured slope. This requires `TR_HYBRID` token graphs.
+The sweep is cached in `ATOM_DSPARK_SPS_CACHE_DIR` (default
+`~/.cache/atom/dspark_sps`, empty disables) under a key of the deployment
+identity below plus the timed shapes; a restart of the same deployment reuses
+it. All ranks agree on hit or miss before the sweep, since it runs collectives.
+Without a profile, confidence uses no temperature scaling (T=1).
 
-Loading validates the config and index-file hashes, model type, TP size, cache
-types, graph setting, GPU name and Torch/HIP versions, plus
-proposal width, batch coverage, positive finite temperatures and a non-increasing
-SPS table. Those hashes identify checkpoint metadata, not every weight byte.
-Recalibrate after a model or runtime change, or for a materially different
-workload; a profile is an optional deployment artifact, not a model default.
+The startup context is the capture context (about 128 tokens), so the curve is
+a short-context target-only baseline; `online_sps` adds what serving adds.
 
-### Building a profile
+**An explicit `calibration_profile`** takes precedence. A profile carries the
+SPS table and **confidence temperatures**, which rescale the drafter's
+per-position survival probabilities; they are fitted against cumulative-survival
+ECE on training blocks and evaluated on held-out request hashes.
 
-`atom.benchmarks.profile_dspark_sps` measures actual target-forward GPU time in
-a disposable model process. The harness uses BF16 KV, FP4 index,
-compilation level 0 with `TR_HYBRID` token graphs (the only mode the online
-runtime admits), batch coverage 128, and query buckets 1/3/6. Its
-128-token startup context is a baseline, not a long-context latency measurement.
-The profiler exits after measurement; its synthetic cache is never used to
-serve requests. Match these settings to the intended deployment.
+Loading a profile validates the config and index-file hashes, model type, TP/DP/
+EP layout, cache types, graph mode and compilation level, GPU name and
+Torch/HIP versions, plus proposal width, batch coverage, positive finite
+temperatures and a non-increasing SPS table. Those hashes identify checkpoint
+metadata, not every weight byte. Recalibrate after a model or runtime change.
 
-```bash
-torchrun --standalone --nproc-per-node=2 \
-  -m atom.benchmarks.profile_dspark_sps \
-  --model /mnt/DeepSeek-V4.1-Flash --output /tmp/sps-measured.json
-```
+### Fitting confidence temperatures
 
 For STS observations, start a **fixed-width** V4.1 server with
 `ATOM_DSPARK_CALIBRATION_DIR=/tmp/dspark-confidence`, then replay the deployment
@@ -149,27 +150,27 @@ as a performance baseline. Separate directories are required for each process.
 The data contains no prompts or token IDs; request hashes do not identify
 conversation trajectories, so the holdout is not a trajectory-disjoint split.
 
+The SPS measurements are the startup sweep's cache file of the same deployment:
+
 ```bash
 python -m atom.benchmarks.fit_dspark \
-  --sps-measurements /tmp/sps-measured.json \
+  --sps-measurements ~/.cache/atom/dspark_sps/<key>.json \
   --confidence /tmp/dspark-confidence/confidence.jsonl \
   --output /tmp/dspark-profile.json
 ```
 
-The fitter rejects mismatched deployment identities, insufficient holdout
-coverage, and incomplete measured row coverage. Inspect training and held-out
-ECE before adopting a profile. Keep requests within its batch/query coverage.
+The fitter rejects mismatched deployment identities and insufficient holdout
+coverage. Inspect training and held-out ECE before adopting a profile.
 
 ### Online SPS correction
 
-Set `online_sps=true` in `--dspark-config` alongside the calibrated profile:
+Set `online_sps=true` in `--dspark-config` (a `calibration_profile` is optional):
 
 ```json
 {
   "confidence_schedule": true,
   "ragged": true,
   "ragged_graph_sizes": "1,3,6",
-  "calibration_profile": "/tmp/dspark-profile.json",
   "online_sps": true
 }
 ```
@@ -249,17 +250,20 @@ For each captured graph and query cap, each DP rank maximizes expected output
 within that row capacity. The group scores the sum of those expected outputs
 against the time of the common executable graph. DP ranks keep different
 per-request verification lengths, but agree on the query cap and graph cost.
-The chosen query cap is carried into `ForwardMode`, including for non-nested
-divisors. The final token count still comes from ordinary DP shape agreement.
+Each rank's frontier rides `ForwardMode`'s one per-step DP exchange
+(`sync_dp_metadata`); every rank resolves the same plan from the gathered rows,
+shrinks its own batch to its share, and the group shape follows the planned
+rows and query cap. The plan adds no DP collective of its own.
 A contraction is discarded if bonus floors or a busier peer leave the group on
 the same graph. Idle dummies retain their existing reserved shape and contribute
 zero expected output tokens.
 
-The planner's CPU exchange happens on every forward, including idle dummies,
-middle prefill chunks and mixed P/D steps. A missing N−2 record or a request-set
+The planner's payload is built on every forward, including idle dummies,
+middle prefill chunks and mixed P/D steps; under TP>1 its delayed confidence is
+broadcast from the TP leader. A missing N−2 record or a request-set
 boundary keeps the full layout for that group step; it does not reuse stale
 confidence. Pending copies retain their source and destination until completion
-and are bounded to four entries. These metadata exchanges and CPU planning add
+and are bounded to four entries. This broadcast and CPU planning add
 overhead; they are outside the target-event timing interval and must be included
 when evaluating end-to-end performance.
 
@@ -268,13 +272,6 @@ key, common executed rows, and phase maxima across all TP/DP workers. A change
 in any rank's request-set generation or real/idle/prefill state changes the
 group generation used for slope fitting. This is an approximate group cost
 model, not a full predictor of the per-rank KV/context distribution.
-
-`atom.benchmarks.profile_dspark_sps` accepts `--dp-size`,
-`--enable-dp-attention`, `--enable-expert-parallel`, and
-`--moe-all2all-backend` for matching deployment measurements. Its torchrun world
-size is TP×DP. Use `--max-num-seqs` to bound the calibration sweep. Fit STS from
-the matching deployment's confidence records before using a profile for
-performance evaluation.
 
 `online_sps_observe_only=true` keeps sampling, TP/DP publication and cost-table
 rebuilding active while using the static cost curve for decisions. Under DP,
@@ -310,7 +307,9 @@ generation-quality and throughput evaluation.
 ## Current limitations
 
 Fixed-width DSpark is the default when speculation is explicitly selected.
-Dynamic verification requires a deployment-specific calibrated profile.
+Dynamic verification measures its cost curve at startup on TR_HYBRID token
+graphs (cached per deployment) unless a calibrated profile is supplied; without
+one, confidence is not temperature-scaled.
 Quality equivalence to non-speculative generation and a general throughput
 improvement have not been established.
 

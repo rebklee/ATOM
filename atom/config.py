@@ -1628,7 +1628,9 @@ class DSparkConfig:
       - disable_sps_calib: skip automatic SPS calibration (replays captured
         graphs at warmup). Without an explicit profile, use the synthetic stub.
       - calibration_profile: JSON file containing model/runtime-bound SPS and
-        STS measurements. Takes precedence over automatic calibration.
+        STS measurements. Takes precedence over automatic calibration. Without
+        one, ragged confidence scheduling measures the SPS curve on the decode
+        token graphs at startup (cached per deployment) and uses T=1 STS.
       - online_sps: correct measured costs using completed TP/DP decode steps.
       - online_sps_sample_interval: pure decode steps between timing samples.
       - online_sps_update_interval: steps between group-consistent publications.
@@ -1657,23 +1659,15 @@ class DSparkConfig:
     def __post_init__(self):
         if self.online_sps_observe_only and not self.online_sps:
             raise ValueError("online_sps_observe_only requires online_sps")
-        if self.bucket_global and not (
-            self.confidence_schedule and self.ragged and self.calibration_profile
-        ):
-            raise ValueError(
-                "bucket_global requires confidence_schedule, ragged and a calibration_profile"
-            )
+        if self.bucket_global and not (self.confidence_schedule and self.ragged):
+            raise ValueError("bucket_global requires confidence_schedule and ragged")
         if (
             type(self.online_sps_window_steps) is not int
             or self.online_sps_window_steps < 10
         ):
             raise ValueError("online_sps_window_steps must be an integer >= 10")
-        if self.online_sps and not (
-            self.confidence_schedule and self.ragged and self.calibration_profile
-        ):
-            raise ValueError(
-                "online_sps requires confidence_schedule, ragged and a calibration_profile"
-            )
+        if self.online_sps and not (self.confidence_schedule and self.ragged):
+            raise ValueError("online_sps requires confidence_schedule and ragged")
         for name in ("online_sps_sample_interval", "online_sps_update_interval"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
