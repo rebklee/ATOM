@@ -1190,6 +1190,21 @@ class TestExplicitPlan:
                 assert getattr(owner.orelse, "value", 0) is None, relpath
                 assert "local_blocks" in ast.unparse(owner.test), relpath
 
+    def test_both_sparse_prefill_sites_scope_refresh_to_the_step(self):
+        """Native and vLLM must reuse one plan refresh across sparse layers."""
+        import ast
+
+        for relpath in (
+            "model_ops/attention_mha.py",
+            "plugin/vllm/attention/minimax_m3_attnetion.py",
+        ):
+            for kw in self._call_kwargs(relpath, "minimax_m3_sparse_attn_prefill_asm"):
+                owner = kw.get("plan_step_owner")
+                assert isinstance(owner, ast.IfExp), f"{relpath}: {owner}"
+                assert getattr(owner.body, "id", None) == "prefill_md", relpath
+                assert getattr(owner.orelse, "value", 0) is None, relpath
+                assert "local_blocks" in ast.unparse(owner.test), relpath
+
     def test_tbo_ubatches_do_not_share_a_step_plan(self, monkeypatch):
         """TBO ubatches share one compute stream; each needs its own plan."""
         from atom.utils.tbo import ubatching
@@ -1253,6 +1268,42 @@ class TestPlanBatchLimit:
     """aiter's planner rejects more than 4096 rows and every FlyDSL call now
     needs a plan, so larger calls (a long sparse prefill folded into rows) must
     go to gluon instead of raising inside the worker."""
+
+    def test_gluon_allocates_omitted_scratch_after_routing(self, monkeypatch):
+        import torch
+
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(ba, "flydsl_decode_seqs", lambda **kw: False)
+        monkeypatch.setattr(ba, "gluon_decode_supports_arch", lambda: True)
+        seen = {}
+
+        def record(*args, **kwargs):
+            seen.update(kwargs)
+
+        monkeypatch.setattr(torch.ops.aiter, "pa_decode_gluon", record)
+        meta = lambda *shape, dtype=torch.bfloat16: torch.empty(
+            shape, dtype=dtype, device="meta"
+        )
+        ba.run_pa_decode(
+            output=meta(8, 16, 128),
+            q=meta(8, 16, 128),
+            k_cache=meta(8, 2, 8, 16, 16),
+            v_cache=meta(8, 2, 1, 128, 16),
+            context_lens=meta(8, dtype=torch.int32),
+            block_tables=meta(8, 8, dtype=torch.int32),
+            softmax_scale=1.0,
+            max_seqlen_q=1,
+            max_context_partition_num=4,
+            context_partition_size=256,
+            compute_type=torch.bfloat16,
+            q_scale=None,
+            k_scale=None,
+            v_scale=None,
+        )
+        assert seen["exp_sums"].shape == (8, 2, 4, 8)
+        assert seen["max_logits"].shape == (8, 2, 4, 8)
+        assert seen["temporary_output"].shape == (8, 2, 4, 8, 128)
 
     def test_rows_past_the_planner_limit_take_gluon(self, monkeypatch):
         import torch

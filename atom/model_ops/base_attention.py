@@ -534,9 +534,9 @@ def run_pa_decode(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
     *,
-    exp_sums: torch.Tensor,
-    max_logits: torch.Tensor,
-    temporary_output: torch.Tensor,
+    exp_sums: torch.Tensor | None = None,
+    max_logits: torch.Tensor | None = None,
+    temporary_output: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
@@ -688,6 +688,26 @@ def run_pa_decode(
             max_context_length=context_bound,
         )
 
+    scratch = (exp_sums, max_logits, temporary_output)
+    if any(t is None for t in scratch):
+        if not all(t is None for t in scratch):
+            raise ValueError("paged decode scratch tensors must be all set or all None")
+        num_seqs = q.shape[0] // max_seqlen_q
+        num_kv_heads = k_cache.shape[1]
+        query_group_size = q.shape[1] // num_kv_heads
+        intermediate_shape = (
+            num_seqs,
+            num_kv_heads,
+            max_context_partition_num,
+            query_group_size,
+        )
+        exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+        max_logits = torch.empty(
+            intermediate_shape, dtype=torch.float32, device=q.device
+        )
+        temporary_output = torch.empty(
+            *intermediate_shape, q.shape[-1], dtype=q.dtype, device=q.device
+        )
     return torch.ops.aiter.pa_decode_gluon(
         output,
         q,

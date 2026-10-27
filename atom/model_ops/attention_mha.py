@@ -1580,6 +1580,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             prefix_lens=prefix_lens,
             sparse_bt=sparse_bt,
             sparse_ctx=sparse_ctx,
+            # Every sparse layer shares these lengths; refresh the plan once.
+            plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
         )
         output = output.view(*q.shape)
         self._index_q = None

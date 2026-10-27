@@ -1415,7 +1415,7 @@ def sparse_pa_per_row(
     # sparse_bt/ctx already carry kv-head-encoded page ids (page = phys16*Hkv +
     # kvh), matching the collapsed cache view. Zero-copy; Hkv == 1 is identity.
     assert q.is_contiguous(), "contiguous q required for the kv-head view"
-    T, num_q_heads_total, head_size = q.shape
+    T, num_q_heads_total, _ = q.shape
     g = num_q_heads_total // num_kv_heads
     q_view = q.view(T * num_kv_heads, g, head_size)
     out_view = output.view(T * num_kv_heads, g, head_size)
@@ -1439,20 +1439,8 @@ def sparse_pa_per_row(
 
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
-    query_group_size = g
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
     context_partition_size = 256
-    intermediate_shape = (
-        num_seqs,
-        num_kv_heads_view,
-        max_context_partition_num,
-        query_group_size,
-    )
-    exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-    max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-    temporary_output = torch.empty(
-        *intermediate_shape, head_size, dtype=q.dtype, device=q.device
-    )
     # compute_type / scales follow the actual KV-cache dtype (this helper serves
     # both bf16 and fp8); the scale tensor collapses like the cache.
     is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
@@ -1478,9 +1466,11 @@ def sparse_pa_per_row(
         q_scale=None,
         k_scale=gluon_k_scale,
         v_scale=gluon_v_scale,
-        exp_sums=exp_sums,
-        max_logits=max_logits,
-        temporary_output=temporary_output,
+        # FlyDSL owns cached plan scratch. Allocate Gluon scratch lazily only
+        # when dispatch falls back, rather than three unused buffers per layer.
+        exp_sums=None,
+        max_logits=None,
+        temporary_output=None,
         alibi_slopes=None,
         sinks=None,
         sliding_window=-1,
@@ -1515,6 +1505,7 @@ def minimax_m3_sparse_attn_prefill_asm(
     sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
     sparse_ctx: torch.Tensor | None = None,
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
+    plan_step_owner=None,
 ) -> None:
     """Block-sparse PREFILL via AITER ASM pa_fwd_asm, per-token-as-decode.
 
@@ -1570,4 +1561,5 @@ def minimax_m3_sparse_attn_prefill_asm(
         output,
         k_scale,
         v_scale,
+        plan_step_owner=plan_step_owner,
     )
