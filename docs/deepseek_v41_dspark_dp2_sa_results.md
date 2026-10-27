@@ -100,6 +100,93 @@ the cost fit, changed batch/cache trajectories, or both explain the regression.
 One simultaneous A/B pair provides no repeatability or significance estimate.
 The earlier TP2/16-lane gain must not be extended to this DP configuration.
 
+## TPOT diagnosis from the existing run
+
+The TPOT regression is dominated by long gaps in streamed output while prefill
+continues and both DP ranks stop scheduling pure decode. It is not evidence of
+a uniform 13.50% increase in decode-kernel execution time. The end-to-end
+regression remains real, and the original metrics above retain every completed
+request. No new performance run was used for this diagnosis.
+
+The actual client source defines `full_response_inter_token_latency` as the
+interval from first non-empty content to request completion divided by output
+length minus one. `inter_chunk_latency` measures consecutive content responses,
+excluding usage-only and DONE chunks. Reconstructing these intervals matches
+the reported TPOT. Across completed requests, final-content-to-completion gaps
+are below 0.12 ms; waiting for terminal bookkeeping does not explain the result.
+
+For each request, sum content gaps longer than 10 seconds and divide by that
+request's output length minus one. Averaging this component over the same
+requests gives the following arithmetic decomposition:
+
+| Mean TPOT component, ms/token | Static | Online | Change |
+| --- | ---: | ---: | ---: |
+| Entire measured TPOT | 225.745 | 256.215 | +30.471 |
+| Contribution from content gaps >10s | 136.655 | 168.163 | +31.507 |
+| Remaining contribution | 89.089 | 88.053 | -1.036 |
+
+Ten seconds is a diagnostic threshold, not an acceptance criterion or a filter
+for the primary result. The remainder still includes shorter scheduling pauses,
+draft/verify work, communication and client overhead; it is not pure GPU time
+or an alternative performance score. There are 286/272 requests with such gaps
+and 1030/1357 gaps in total. For the 461 unique source-matched pairs, the same
+component accounts for 35.576 of the 37.574 ms/token increase (94.68%), so the
+effect is also present within matched sources.
+
+A matched request with approximately 227K uncached input tokens and exactly
+13 output tokens illustrates the first-token boundary effect:
+
+| Request timing | Static | Online |
+| --- | ---: | ---: |
+| TTFT, seconds | 131.836 | 40.056 |
+| First-to-second content response gap, seconds | 0.113 | 99.746 |
+| First content to completion, seconds | 0.469 | 103.015 |
+| End-to-end request latency, seconds | 132.306 | 143.070 |
+| TPOT, ms/token | 39.118 | 8584.546 |
+
+The online first content arrives at 14:17:39.962 UTC. Of the following
+99.746-second gap, 97.711 seconds overlap an interval in which both ranks'
+pure-decode counters stay unchanged. Static completes prefill later and its
+short output lands in a decode window. An earlier first token can therefore
+move waiting from TTFT into TPOT; it does not make the subsequent wait harmless.
+
+Independent server evidence identifies the scheduling mechanism:
+
+- Around profiling second 300, counters on both ranks show no new pure-decode
+  step for at least 113.525 seconds static and 137.859 seconds online. Inside
+  these intervals, logs record 504/557 prefill batches across both ranks,
+  totaling 8.00M/8.97M scheduled prefill tokens. These are scheduled token
+  counts, not GPU-time estimates. Counter sampling remains regular, with no
+  formal-window interval above 2.012 seconds.
+- Approximately 90% of the summed duration of all >10s content gaps overlaps
+  intervals with unchanged decode counters on both ranks. These overlaps use
+  the intersection of the two ranks' two-second sample intervals and thus
+  conservatively omit boundary time; they do not measure kernel durations.
+- During the online 138-second episode, the joint planner keeps being called,
+  pure-decode count stays at 2103, and SPS stays at version 32 with 255 accepted
+  samples and 32 publications. Prefill progresses; the episode is not spent
+  publishing a new SPS fit.
+- Startup logs confirm both arms have `prefill_decode_interval=0`, a 16384-token
+  batch budget, and KV high watermark 0.9. `Scheduler._schedule()` returns a
+  prefill batch before considering decode. With token graphs, its group-prefill
+  gate also makes ranks without local prefill run a dummy prefill. When KV is
+  high, `PrefillDelayer._decide()` releases prefill even without rank alignment.
+  Without decode protection, consecutive releases can starve existing decodes.
+
+This establishes prefill scheduling as the immediate cause of the observed
+long output stalls. It does not isolate why online SPS produces a worse batch,
+cache and admission trajectory in this closed-loop run; altered SPS decisions
+may still contribute upstream. The throughput regression is unchanged.
+
+The next focused control should enable the existing
+`ATOM_PREFILL_DECODE_INTERVAL=1` in **both** arms: when decode work exists,
+the DP-wide execution signal reserves a decode scheduling opportunity after
+each executed prefill. This can test the starvation mechanism without removing
+DP graph synchronization or changing only one arm's scheduler. One opportunity
+is not a millisecond latency guarantee; a prefill-time budget may also be needed.
+This control has not been performance-tested here, and no recovery or dynamic
+SPS gain is claimed from this diagnosis.
+
 This performance run does not resolve the prior output-equivalence issue:
 fresh unchanged full-width references also differed. The PR remains draft;
 actual EP/MoRI and multi-host model execution remain unvalidated. See the
