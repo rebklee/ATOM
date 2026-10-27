@@ -1,4 +1,10 @@
-# DSpark DP2: concurrent 128-lane SA A/B
+# DSpark DP2: interval 0, concurrent 128-lane SA A/B
+
+This report preserves the original interval-0 experiment. The subsequent
+[interval-10 A/B](deepseek_v41_dspark_dp2_interval10_results.md), with the same
+production source and profile, observes +12.37% server output/GPU, +6.68%
+completed-client output and +0.54% mean TPOT. These are separate configurations;
+the original negative result below is unchanged.
 
 **This configuration did not show a throughput gain from online SPS.** Server
 output throughput per GPU decreased 6.45% in the 900-second window. AIPerf's
@@ -178,14 +184,11 @@ long output stalls. It does not isolate why online SPS produces a worse batch,
 cache and admission trajectory in this closed-loop run; altered SPS decisions
 may still contribute upstream. The throughput regression is unchanged.
 
-The next focused control should enable the existing
-`ATOM_PREFILL_DECODE_INTERVAL=1` in **both** arms: when decode work exists,
-the DP-wide execution signal reserves a decode scheduling opportunity after
-each executed prefill. This can test the starvation mechanism without removing
-DP graph synchronization or changing only one arm's scheduler. One opportunity
-is not a millisecond latency guarantee; a prefill-time budget may also be needed.
-This control has not been performance-tested here, and no recovery or dynamic
-SPS gain is claimed from this diagnosis.
+The follow-up control sets `ATOM_PREFILL_DECODE_INTERVAL=10` in both arms.
+The completed [interval-10 A/B](deepseek_v41_dspark_dp2_interval10_results.md)
+has no >10-second content gaps among completed requests, +12.37% server output
+per GPU and +0.54% mean TPOT for online relative to static. That report includes
+the separate configurations, TTFT tradeoff and remaining attribution limits.
 
 This performance run does not resolve the prior output-equivalence issue:
 fresh unchanged full-width references also differed. The PR remains draft;
