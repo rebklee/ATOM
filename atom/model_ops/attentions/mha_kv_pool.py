@@ -283,13 +283,11 @@ class MhaKvPool:
         the pool is layer-major: an entry's bytes are `entries` apart, so no
         contiguous range is one entry.
 
-        Named for the reader, and parsed as `{field}.layer_{row}` by the
-        exports that name their units globally (MiniMax-M3's, a paged
-        draft's). The connector uses consumer indices to pair the two ends
-        and checks the role at the mapped position. What a name buys is that
-        `set_block_count`'s refusal says which
-        region is wrong -- `k` of layer 12, not region 37 -- and the folded
-        order (all of K, then all of V) makes that worth having.
+        Names describe pool-local rows as `{field}.layer_{row}`. A model can
+        supply global identities and consumer indices before registration.
+        The connector pairs by consumer index and checks the mapped role.
+        Names also let `set_block_count` identify which region is wrong --
+        `k` of layer 12, not region 37.
         """
         return [
             (f"{name}.layer_{layer}", view[layer])

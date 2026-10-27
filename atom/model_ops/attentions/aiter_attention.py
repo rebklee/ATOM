@@ -778,8 +778,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         if not self.kv_pools:
             return None
-        if self._has_sparse_attention:
-            return self._minimax_m3_transfer_tensors()
         return KVTransferTensors(
             # Every field of every pool, indexer cache included: a unit per
             # (pool, field, layer), in declared order. The geometry is in the
@@ -793,66 +791,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # GQA/MQA KV heads are sharded or only partially replicated across
             # TP. In particular MiniMax-M3 must keep one stored shard per rank;
             # whole-object TP collapse is unsafe for this PAGE layout.
-            tp_replication_factor=1,
-        )
-
-    def _minimax_m3_transfer_tensors(self):
-        """Publish M3 pages and their explicit consumer indices, as MLA does.
-
-        The consumer lists each KV/scale field over all layers, then compact
-        index-cache rows over sparse layers. A stage contributes only its rows.
-        Sparse KV uses page-16 SHUFFLE runs; the indexer key moves whole.
-        """
-        from atom.kv_transfer.disaggregation.page_region import page_region
-        from atom.kv_transfer.disaggregation.types import KVTransferTensors
-        from atom.model_ops.minimax_m3.sparse_attn import ASM_PAGE_SIZE
-
-        config = self.model_runner.config.hf_config
-        config = getattr(config, "text_config", config)
-        num_layers = config.num_hidden_layers
-        sparse_layers = [
-            i
-            for i, enabled in enumerate(
-                config.sparse_attention_config.get("sparse_attention_freq") or ()
-            )
-            if enabled
-        ]
-        index_slots = {layer: row for row, layer in enumerate(sparse_layers)}
-        # M3's dense and sparse layers use the same KV-head geometry.
-        if len(self.kv_pools) != 1:
-            raise ValueError("MiniMax-M3 transfer expects one KV-head geometry")
-        pool = next(iter(self.kv_pools.values()))
-        fields = pool.cache_fields + pool.scale_fields
-        field_offsets = {f.name: i * num_layers for i, f in enumerate(fields)}
-        index_offset = len(fields) * num_layers
-        index_layers = {r: m for m, r in self.pool_rows.get(INDEX_ROWS, {}).items()}
-        pages, consumer_indices = [], []
-        for geometry, pool in self.kv_pools.items():
-            kv_layers = {r: m for m, r in self.pool_rows[geometry].items()}
-            for role, tensor in pool.region_tensors():
-                field, row = role.rsplit(".layer_", 1)
-                runs = None
-                if field == "index":
-                    module = index_layers[int(row)]
-                    consumer_index = index_offset + index_slots[module.layer_num]
-                else:
-                    module = kv_layers[int(row)]
-                    consumer_index = field_offsets[field] + module.layer_num
-                    sparse = _is_indexed_sparse_attention(module)
-                    page = ASM_PAGE_SIZE if sparse else pool.block_size
-                    runs = (self.model_runner.block_size // page, pool.num_kv_heads)
-                pages.append(
-                    page_region(
-                        tensor,
-                        semantic_role=f"m3.layer_{module.layer_num}.{field}",
-                        head_major_runs=runs,
-                    )
-                )
-                consumer_indices.append(consumer_index)
-        return KVTransferTensors(
-            pages=pages,
-            block_region_consumer_indices=consumer_indices,
-            block_region_consumer_count=index_offset + len(sparse_layers),
             tp_replication_factor=1,
         )
 

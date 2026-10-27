@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: MIT
 """MiniMax-M3 P/D from a PP prefill (TP1 stages) into a TP-sharded decode.
 
-The backend maps a stage's regions into the full consumer layout, including
-the appended draft. The byte test drives the real descriptor builder against
-host buffers, so a wrong region or head offset shows up as a wrong byte.
+The model annotates the backend's regions before the runner appends the draft.
+The byte test drives the real descriptor builder against host buffers, so a
+wrong region or head offset shows up as a wrong byte.
 """
 
-from types import SimpleNamespace
+import __future__
+
+import ast
+from pathlib import Path
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,6 +29,53 @@ CONFIG = SimpleNamespace(
     num_hidden_layers=8,
     sparse_attention_config={"sparse_attention_freq": [1, 0, 1, 0, 0, 0, 1, 0]},
 )
+
+
+def _cache_methods(path, cls_name, names):
+    # Run the shipped cache-registration methods without loading unrelated
+    # model kernels or initializing the GPU runner. Pools/exporters below are
+    # real; only the owner objects stand in for weight-loaded models.
+    source = Path(__file__).resolve().parents[1] / path
+    tree = ast.parse(source.read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls_name
+    )
+    methods = [
+        n
+        for n in tree.body + cls.body
+        if isinstance(n, ast.FunctionDef) and n.name in names
+    ]
+    namespace = {}
+    exec(  # noqa: S102 -- execute the shipped methods under the CPU fixture
+        compile(
+            ast.Module(body=methods, type_ignores=[]),
+            str(source),
+            "exec",
+            flags=__future__.annotations.compiler_flag,
+        ),
+        namespace,
+    )
+    return namespace
+
+
+_MODEL_SOURCE = "atom/models/minimax_m3/model.py"
+_configure_model = _cache_methods(
+    _MODEL_SOURCE,
+    "MiniMaxM3SparseForCausalLM",
+    (
+        "_sparse_attention_layer_ids",
+        "_sparse_attention_layer_ordinals",
+        "configure_kv_transfer_tensors",
+    ),
+)["configure_kv_transfer_tensors"]
+_configure_wrapper = _cache_methods(
+    _MODEL_SOURCE,
+    "MiniMaxM3SparseForConditionalGenerationTextOnly",
+    ("configure_kv_transfer_tensors",),
+)["configure_kv_transfer_tensors"]
+_runner_transfer = _cache_methods(
+    "atom/model_engine/model_runner.py", "ModelRunner", ("_get_kv_transfer_tensors",)
+)["_get_kv_transfer_tensors"]
 
 
 class _Layer:
@@ -57,11 +108,20 @@ def _m3_builder(layer_nums, sparse, heads, config=None, kv_dtype=torch.float8_e4
             num_hidden_layers=60,
             sparse_attention_config={"sparse_attention_freq": [0, 1] * 30},
         )
+    model = SimpleNamespace(config=config)
+    model.configure_kv_transfer_tensors = MethodType(_configure_model, model)
     builder.model_runner = SimpleNamespace(
-        block_size=BLOCK, config=SimpleNamespace(hf_config=config)
+        block_size=BLOCK, model=model, attn_metadata_builder=builder
     )
-    builder._has_sparse_attention = True
     return builder
+
+
+def _export(builder, draft=None):
+    if draft is not None:
+        builder.model_runner.draft_kv_builder = SimpleNamespace(
+            get_kv_transfer_tensors=lambda: draft
+        )
+    return _runner_transfer(builder.model_runner, 4)
 
 
 def _draft_tensors(heads, kv_dtype=torch.float8_e4m3fn):
@@ -86,16 +146,22 @@ def _transfer(layer_nums, heads, draft=False, kv_dtype=torch.float8_e4m3fn):
     sparse = [
         CONFIG.sparse_attention_config["sparse_attention_freq"][i] for i in layer_nums
     ]
-    tt = _m3_builder(
-        layer_nums, sparse, heads, CONFIG, kv_dtype
-    ).get_kv_transfer_tensors()
-    if draft:
-        tt.merge_pages(_draft_tensors(heads, kv_dtype))
-    return tt
+    return _export(
+        _m3_builder(layer_nums, sparse, heads, CONFIG, kv_dtype),
+        _draft_tensors(heads, kv_dtype) if draft else None,
+    )
 
 
 def test_m3_units_are_named_by_global_layer_and_split_by_head():
-    tt = _m3_builder([15, 16], [True, False], heads=4).get_kv_transfer_tensors()
+    builder = _m3_builder([15, 16], [True, False], heads=4)
+    raw = builder.get_kv_transfer_tensors()
+    tt = _export(builder)
+    for original, annotated in zip(raw.pages, tt.pages, strict=True):
+        assert original.region.base_addr == annotated.region.base_addr
+        assert original.region.total_bytes == annotated.region.total_bytes
+        assert original.region.unit_bytes == annotated.region.unit_bytes
+        assert original.view.data_ptr() == annotated.view.data_ptr()
+    assert tt.state_backend is builder and tt.num_blocks == 4
     assert tt.block_region_consumer_indices == [15, 16, 75, 76, 135, 136, 195, 196, 247]
     assert tt.block_region_consumer_count == 270
     runs = {p.region.semantic_role: p.head_major_runs for p in tt.pages}
@@ -114,9 +180,38 @@ def test_no_sparse_schedule_has_no_global_index_regions(schedule):
         num_hidden_layers=3,
         sparse_attention_config={"sparse_index_dim": 128, **schedule},
     )
-    tt = _m3_builder([1], [False], 4, config).get_kv_transfer_tensors()
+    tt = _export(_m3_builder([1], [False], 4, config))
     assert tt.block_region_consumer_indices == [1, 4, 7, 10]
     assert tt.block_region_consumer_count == 12
+
+
+def test_text_wrapper_forwards_layout_before_draft_is_appended():
+    builder = _m3_builder([6, 7], [True, False], 4, CONFIG)
+    wrapper = SimpleNamespace(language_model=builder.model_runner.model)
+    wrapper.configure_kv_transfer_tensors = MethodType(_configure_wrapper, wrapper)
+    builder.model_runner.model = wrapper
+    tt = _export(builder, _draft_tensors(4))
+    expected = _transfer([6, 7], 4, draft=True)
+    assert tt.block_region_consumer_indices == expected.block_region_consumer_indices
+    assert _layout(tt) == _layout(expected)
+
+
+def test_runner_without_model_hook_keeps_generic_mha_layout():
+    builder = _m3_builder([0, 1], [True, False], 4, CONFIG)
+    builder.model_runner.model = SimpleNamespace()
+    raw = builder.get_kv_transfer_tensors()
+    tt = _export(builder, _draft_tensors(4))
+    assert _layout(tt)[: len(raw.pages)] == _layout(raw)
+    assert all(r.semantic_role.startswith("mha.") for r in raw.block_regions)
+    assert tt.block_region_consumer_indices is None
+    assert tt.block_region_consumer_count is None
+    assert tt.state_backend is builder and tt.num_blocks == 4
+
+
+def test_runner_without_transfer_regions():
+    builder = _m3_builder([0], [True], 4, CONFIG)
+    builder.kv_pools = {}
+    assert _export(builder) is None
 
 
 @pytest.mark.parametrize("heads", [1, 4])
@@ -148,7 +243,7 @@ def test_page16_runs_are_how_the_sparse_writer_lays_heads_out():
     for view in (views[0].view(torch.uint8), views[1].view(torch.uint8)):
         for head in range(4):
             view[:, head].fill_(head + 1)
-    for page in builder.get_kv_transfer_tensors().pages:
+    for page in _export(builder).pages:
         if page.region.semantic_role in ("m3.layer_15.k", "m3.layer_15.v"):
             unit = page.view[2].view(8, 4, -1)
             for head in range(4):
