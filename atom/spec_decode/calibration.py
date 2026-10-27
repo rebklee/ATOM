@@ -63,7 +63,17 @@ def calibration_identity(config, device):
 
 def validate_calibration(profile, identity, *, width, max_batch):
     recorded = profile.get("identity")
-    # Earlier version-1 profiles could only be produced for plain TP. Retain
+    if isinstance(recorded, dict) and not {"graph_mode", "compilation_level"} <= set(
+        recorded
+    ):
+        # Earlier profiles do not say which graph mode / compilation level
+        # they measured, and the cost of a shape depends on both.
+        raise ValueError(
+            "DSpark calibration predates graph-mode binding (no graph_mode / "
+            "compilation_level in its identity); regenerate it with "
+            "atom.benchmarks.profile_dspark_sps and fit_dspark"
+        )
+    # Version-1 profiles could only be produced for plain TP. Retain
     # that compatibility, but never silently reinterpret one as DP or EP.
     if (
         isinstance(recorded, dict)

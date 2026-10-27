@@ -126,8 +126,9 @@ workload; a profile is an optional deployment artifact, not a model default.
 ### Building a profile
 
 `atom.benchmarks.profile_dspark_sps` measures actual target-forward GPU time in
-a disposable model process. The initial harness uses BF16 KV, FP4 index,
-compilation level 3 FULL, batch coverage 128, and query buckets 1/3/6. Its
+a disposable model process. The harness uses BF16 KV, FP4 index,
+compilation level 0 with `TR_HYBRID` token graphs (the only mode the online
+runtime admits), batch coverage 128, and query buckets 1/3/6. Its
 128-token startup context is a baseline, not a long-context latency measurement.
 The profiler exits after measurement; its synthetic cache is never used to
 serve requests. Match these settings to the intended deployment.
@@ -179,14 +180,16 @@ completed serving steps:
 `latency_ms(rows, requests) = baseline_ms(rows) + fixed_ms(requests) + slope_ms(requests) * rows + post_ms(requests)`.
 
 A size-independent residual is a fixed offset, not a marginal per-row cost.
-Additional slope is learned only from different executed graph sizes at the
-same request count and request-set generation within one publication-sized
-decode-step cohort (64 steps by default). Each size needs two observations;
-the batch needs ten supporting observations across eligible cohorts. Adjacent
-per-size residual medians produce slopes, whose median is clamped nonnegative.
-With no shape diversity or support, the additional slope is zero and the
-measured startup curve still supplies its original marginal costs. Positive
-slopes are never borrowed from another batch.
+The additional slope is fitted from the whole history window, as DeepInfer's
+`ForwardRuntimeEstimator` does: each executed graph size contributes one
+median residual (at least five observations), so serving traffic -- whose graph
+size follows its batch size -- supplies the contrasts. Unlike DeepInfer, which
+divides each residual by its graph size and so charges fixed overhead per row,
+the fit keeps an intercept: a Theil-Sen line (median pairwise slope) through
+the per-size medians, clamped nonnegative, needing at least three sizes and
+ten observations. A batch with its own spread of graph sizes gets its own
+line; other batches share the global slope. Without enough sizes the slope is
+zero and the measured startup curve supplies the marginal costs.
 
 The estimator retains the latest 5000 eligible decode steps
 (`online_sps_window_steps`), approximately 625 samples at the default cadence.

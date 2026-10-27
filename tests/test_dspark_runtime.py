@@ -157,6 +157,20 @@ def test_online_rejects_graph_modes_that_do_not_apply_ragged(runtime, mode):
         validate_online_runtime(runtime.runner.config)
 
 
+@pytest.mark.parametrize(
+    "sizes,ok", [("1,3,6", True), ("1,2,6", True), ("1,2,3,6", False), ("2,3", False)]
+)
+def test_online_requires_nested_query_buckets(runtime, sizes, ok):
+    """The top-m search only visits survival prefixes; with non-nested caps
+    (2 and 3) a smaller divisible graph can need a non-prefix allocation."""
+    runtime.runner.config.dspark.ragged_graph_sizes = sizes
+    if ok:
+        validate_online_runtime(runtime.runner.config)
+    else:
+        with pytest.raises(ValueError, match="nested query buckets"):
+            validate_online_runtime(runtime.runner.config)
+
+
 def test_measured_cost_changes_verification_for_identical_confidence(runtime):
     from atom.spec_decode.dspark_verify import VerifyScheduler
 
@@ -224,11 +238,13 @@ def test_request_set_generation_only_changes_on_membership_or_order(runtime):
 
 def test_runtime_tables_use_batch_local_affine_coefficients(runtime):
     rt = runtime
-    for i in range(12):
-        rows = 6 if i % 2 else 12
+    for i in range(30):
+        rows = (6, 12, 18)[i % 3]
         rt.model.observe(
             1, rows, rt.model.baseline_ms[rows] + 7 + 0.2 * rows, 2, context=1
         )
+    for _ in range(10):
+        rt.model.observe(2, 12, rt.model.baseline_ms[12] + 3 + 0.2 * 12, 2, context=1)
     rt.model.publish()
     base = torch.tensor([1000 / (1 + i * 0.1) for i in range(49)])
     for b in [1, 2]:

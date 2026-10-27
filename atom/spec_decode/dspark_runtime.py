@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 from dataclasses import dataclass
@@ -29,6 +30,19 @@ def validate_online_runtime(config):
     ):
         raise ValueError(
             "Online DSpark SPS requires PP/PCP/DCP=1, graphs, and TBO disabled"
+        )
+    from atom.spec_decode.dspark_scheduler import resolve_q_buckets
+
+    spec = getattr(config, "speculative_config", None)
+    width = getattr(spec, "num_speculative_tokens", 5) + 1
+    qs = resolve_q_buckets(getattr(config.dspark, "ragged_graph_sizes", ""), width)
+    if any(b % a for a, b in itertools.pairwise(qs)):
+        # The top-m search admits global survival prefixes per q cap; with a
+        # pair like 2 and 3 a non-prefix allocation can reach a smaller
+        # divisible graph that search never visits.
+        raise ValueError(
+            f"Online DSpark SPS / bucket_global need nested query buckets (each "
+            f"divides the next), got {qs}; e.g. 1,3,6 or 1,2,6"
         )
     mode = config.compilation_config.cudagraph_mode
     if mode is None or not mode.uses_tr_hybrid():
@@ -60,7 +74,6 @@ class DSparkRuntime:
             profile["sps_table"],
             runner.config.max_num_seqs,
             window=cfg.online_sps_window_steps,
-            cohort_steps=cfg.online_sps_update_interval,
         )
         self.sample_interval = cfg.online_sps_sample_interval
         self.update_interval = cfg.online_sps_update_interval

@@ -232,7 +232,9 @@ class DPVerifyPlanner:
         if len(self.pending) >= 4:
             self.skipped_busy += 1
             return
-        capacity = (self.runner.config.max_num_seqs, self.gamma)
+        # Block drafters draft at least two requests (warmup does even with
+        # max_num_seqs=1), as TokenIDProcessor's output capacity allows.
+        capacity = (max(self.runner.config.max_num_seqs, 2), self.gamma)
         cpu = (
             self.free.pop()
             if self.free

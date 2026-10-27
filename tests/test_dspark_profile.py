@@ -21,7 +21,12 @@ def test_single_node_worker_rank_retains_the_full_node_dp_slice():
 def profile():
     return {
         "version": 1,
-        "identity": {"gpu": "test", "model": "test"},
+        "identity": {
+            "gpu": "test",
+            "model": "test",
+            "graph_mode": "TR_HYBRID",
+            "compilation_level": 0,
+        },
         "draft_width": 5,
         "max_num_seqs": 4,
         "sts_temperatures": [1.0] * 5,
@@ -139,3 +144,16 @@ def test_dp_profiler_refuses_uncovered_graphs_before_loading(monkeypatch):
         prof, "single_node_parallel_config", lambda *a: pytest.skip("past the check")
     )
     prof.main()
+
+
+def test_a_profile_without_graph_fields_must_be_regenerated():
+    """Older profiles do not record the graph mode / compilation level they
+    measured; they are refused with a targeted message, not reinterpreted."""
+    data = profile()
+    for field in ("graph_mode", "compilation_level"):
+        old = {
+            **data,
+            "identity": {k: v for k, v in data["identity"].items() if k != field},
+        }
+        with pytest.raises(ValueError, match="predates graph-mode binding"):
+            validate_calibration(old, data["identity"], width=5, max_batch=4)

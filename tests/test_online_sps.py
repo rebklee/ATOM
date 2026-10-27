@@ -22,24 +22,55 @@ def test_constant_runtime_overhead_is_fixed_not_marginal():
     assert model.estimate_ms(6, 1) == pytest.approx(10.6)
 
 
-def test_genuine_marginal_cost_is_learned_only_for_observed_batch():
+def test_genuine_marginal_cost_is_learned_with_a_separate_intercept():
     model = estimator()
-    for i in range(12):
-        rows = 6 if i % 2 else 12
+    for i in range(30):
+        rows = (6, 12, 18)[i % 3]
         residual = 7 + 0.2 * rows + (100 if i == 0 else 0)
         model.observe(1, rows, model.baseline_ms[rows] + residual, 2, context=1)
     model.publish()
     assert model.slope_ms_for(1) == pytest.approx(0.2)
     assert model.fixed_ms(1) == pytest.approx(7)
-    assert model.slope_ms_for(2) == 0
-    assert model.fixed_ms(2) == pytest.approx(7)
-    assert model.support_by_batch[1] == 12
+    assert model.support_by_batch[1] == 30
+
+
+def test_serving_contrasts_come_from_different_batches_like_deepinfer():
+    """In serving a batch keeps one graph size; the sizes come from batches
+    of different sizes. Their per-size medians give the global slope, which
+    batches without their own spread share, each keeping its own offset."""
+    model = estimator()
+    for i in range(60):
+        batch = (1, 2, 3)[i % 3]
+        rows = 6 * batch
+        fixed = 5 + batch  # the offset differs by batch too
+        model.observe(batch, rows, model.baseline_ms[rows] + fixed + 0.2 * rows, 2)
+    model.publish()
+    # Per-batch offsets 6/7/8 over 6/12/18 rows add 1/6 ms per row to 0.2.
+    assert model.slope_ms == pytest.approx(0.2 + 1 / 6)
+    assert model.slope_by_batch == {}
+    for batch in (1, 2, 3):
+        rows = 6 * batch
+        assert model.estimate_ms(rows, batch) == pytest.approx(
+            model.baseline_ms[rows] + 5 + batch + 0.2 * rows + 2
+        )
+
+
+def test_a_constant_offset_never_becomes_a_per_row_cost():
+    """DeepInfer divides each residual by the graph size; a constant offset
+    then costs more on bigger graphs. The intercept keeps it flat."""
+    model = estimator()
+    for i in range(30):
+        rows = (6, 12, 24)[i % 3]
+        model.observe(1, rows, model.baseline_ms[rows] + 7, 2)
+    model.publish()
+    assert model.slope_ms == 0
+    assert model.fixed_ms(1) == pytest.approx(7)
 
 
 @pytest.mark.parametrize(
     "separation", ["batch", "request_set", "time", "unknown_context"]
 )
-def test_drift_cannot_masquerade_as_marginal_cost(separation):
+def test_two_graph_sizes_cannot_turn_a_level_shift_into_slope(separation):
     model = estimator()
     for i in range(24):
         high = i >= 12
